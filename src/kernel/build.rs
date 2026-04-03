@@ -19,7 +19,8 @@ use crate::state::store::StateStore;
 
 const KERNEL_TAG: &str = "microvm-kernel-6.1.163-20.299.amzn2023";
 const KERNEL_REPO: &str = "https://github.com/amazonlinux/linux.git";
-const BASE_CONFIG_URL: &str = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/main/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config";
+const BASE_CONFIG_X86_64: &str = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/main/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config";
+const BASE_CONFIG_AARCH64: &str = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/main/resources/guest_configs/microvm-kernel-ci-aarch64-6.1.config";
 const BUILDER_IMAGE: &str = "ember-kernel-builder";
 
 const DOCKERFILE: &str = include_str!("../../kernel/Dockerfile");
@@ -61,7 +62,17 @@ pub fn detect_container_tool() -> anyhow::Result<String> {
 ///
 /// Returns the path to the installed kernel.
 pub fn build(store: &StateStore, jobs: usize, tool: &str) -> anyhow::Result<PathBuf> {
-    let work_dir = tempfile::tempdir().context("failed to create temp build directory")?;
+    // On macOS, container runtimes (Colima, Docker Desktop) may not share
+    // /var/folders or /tmp. Use $HOME so the volume mount works reliably.
+    let work_dir = if cfg!(target_os = "macos") {
+        let home = std::env::var("HOME").context("HOME not set")?;
+        tempfile::Builder::new()
+            .prefix(".ember-kernel-build-")
+            .tempdir_in(home)
+            .context("failed to create temp build directory in $HOME")?
+    } else {
+        tempfile::tempdir().context("failed to create temp build directory")?
+    };
     let work = work_dir.path();
 
     println!("Build directory: {}", work.display());
@@ -96,14 +107,22 @@ pub fn build(store: &StateStore, jobs: usize, tool: &str) -> anyhow::Result<Path
     //   3. Merge base config + docker.fragment + avf.fragment
     //   4. Strip BUILD_SALT for reproducibility
     //   5. Compile vmlinux
-    let uid = nix::unistd::getuid();
-    let gid = nix::unistd::getgid();
-    let user_flag = format!("{}:{}", uid, gid);
+    #[cfg(target_os = "linux")]
+    let user_flag = {
+        let uid = nix::unistd::getuid();
+        let gid = nix::unistd::getgid();
+        format!("{}:{}", uid, gid)
+    };
+
+    let base_config_url = match std::env::consts::ARCH {
+        "aarch64" => BASE_CONFIG_AARCH64,
+        _ => BASE_CONFIG_X86_64,
+    };
 
     let build_script = format!(
         "set -e\n\
          echo '==> Downloading Firecracker CI kernel config...'\n\
-         curl -fSL -o base.config '{BASE_CONFIG_URL}'\n\
+         curl -fSL -o base.config '{base_config_url}'\n\
          echo '==> Cloning kernel source (shallow, tag {KERNEL_TAG})...'\n\
          git clone --depth 1 --branch '{KERNEL_TAG}' '{KERNEL_REPO}' linux\n\
          echo '==> Merging base config + fragments...'\n\
@@ -111,27 +130,33 @@ pub fn build(store: &StateStore, jobs: usize, tool: &str) -> anyhow::Result<Path
          KCONFIG_CONFIG=.config scripts/kconfig/merge_config.sh -m ../base.config ../docker.fragment ../avf.fragment\n\
          sed -i 's/^CONFIG_BUILD_SALT=.*/CONFIG_BUILD_SALT=\"\"/' .config\n\
          make olddefconfig\n\
-         echo '==> Building vmlinux ({jobs} jobs)...'\n\
-         make -j{jobs} vmlinux\n\
+         echo '==> Building kernel ({jobs} jobs)...'\n\
+         make -j{jobs} vmlinux Image\n\
          echo '==> Done.'"
     );
 
     println!("Starting kernel build (this may take 10-30 minutes)...");
+    let mut docker_args = vec!["run".to_string(), "--rm".to_string()];
+    // On macOS, Docker Desktop handles file ownership via its file-sharing
+    // layer, and passing --user with the host UID causes permission errors
+    // on the mounted volume. Only use --user on Linux.
+    #[cfg(target_os = "linux")]
+    {
+        docker_args.push("--user".to_string());
+        docker_args.push(user_flag);
+    }
+    docker_args.extend([
+        "-v".to_string(),
+        format!("{}:/build", work.display()),
+        "-w".to_string(),
+        "/build".to_string(),
+        BUILDER_IMAGE.to_string(),
+        "sh".to_string(),
+        "-c".to_string(),
+        build_script,
+    ]);
     let status = Command::new(tool)
-        .args([
-            "run",
-            "--rm",
-            "--user",
-            &user_flag,
-            "-v",
-            &format!("{}:/build", work.display()),
-            "-w",
-            "/build",
-            BUILDER_IMAGE,
-            "sh",
-            "-c",
-            &build_script,
-        ])
+        .args(&docker_args)
         .status()
         .with_context(|| format!("failed to execute '{tool} run'"))?;
     if !status.success() {
@@ -142,10 +167,15 @@ pub fn build(store: &StateStore, jobs: usize, tool: &str) -> anyhow::Result<Path
     }
 
     // Copy the built kernel to the state store.
-    let built = work.join("linux/vmlinux");
+    // On aarch64, AVF requires the boot Image (not ELF vmlinux).
+    let built = if std::env::consts::ARCH == "aarch64" {
+        work.join("linux/arch/arm64/boot/Image")
+    } else {
+        work.join("linux/vmlinux")
+    };
     if !built.exists() {
         bail!(
-            "build completed but vmlinux not found at {}",
+            "build completed but kernel not found at {}",
             built.display()
         );
     }
