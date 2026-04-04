@@ -115,6 +115,15 @@ impl KernelSpec {
                 Ok(dest)
             }
             KernelSpec::Preset(preset) => {
+                // The stock Firecracker CI kernel lacks virtio-pci and
+                // virtio-console drivers required by AVF — reject it on macOS
+                // even if already cached.
+                if cfg!(target_os = "macos") && *preset == KernelPreset::Stock {
+                    anyhow::bail!(
+                        "The stock kernel is not compatible with Apple Virtualization Framework.\n\
+                         Hint: run `ember kernel build` to build an AVF-compatible kernel."
+                    );
+                }
                 let dest = store.kernel_dir().join(preset.filename());
                 if dest.exists() {
                     println!("Using {preset} kernel at {}", dest.display());
@@ -128,13 +137,21 @@ impl KernelSpec {
                         Ok(dest)
                     }
                     None => {
-                        anyhow::bail!(
-                            "Default kernel has not been built yet.\n\
-                             Hint: run `sudo ember kernel build` to compile a kernel \
-                             with Docker networking support,\n\
-                             or use `--kernel stock` for a pre-built kernel without \
-                             Docker support."
-                        );
+                        if cfg!(target_os = "macos") {
+                            anyhow::bail!(
+                                "Default kernel has not been built yet.\n\
+                                 Hint: run `ember kernel build` to compile an \
+                                 AVF-compatible kernel with Docker networking support."
+                            );
+                        } else {
+                            anyhow::bail!(
+                                "Default kernel has not been built yet.\n\
+                                 Hint: run `sudo ember kernel build` to compile a kernel \
+                                 with Docker networking support,\n\
+                                 or use `--kernel stock` for a pre-built kernel without \
+                                 Docker support."
+                            );
+                        }
                     }
                 }
             }

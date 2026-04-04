@@ -134,6 +134,19 @@ fn pull(args: &PullArgs, state_dir: &Path) -> anyhow::Result<()> {
 
     rollback.commit();
 
+    // Warn if the image likely lacks an SSH server — minimal OCI images
+    // (Alpine, busybox, etc.) typically don't include one.
+    let has_sshd = rootfs_dir.join("usr/sbin/sshd").exists()
+        || rootfs_dir.join("usr/bin/dropbear").exists()
+        || rootfs_dir.join("usr/sbin/dropbear").exists();
+    if !has_sshd {
+        println!(
+            "\nNote: this image does not appear to include an SSH server.\n\
+             `ember ssh` will not work. Use `ember image build` to create\n\
+             an image with SSH support, or pull an image that includes sshd."
+        );
+    }
+
     println!("Image '{reference}' pulled successfully as '{local_name}'.");
     Ok(())
 }

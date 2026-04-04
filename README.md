@@ -14,7 +14,7 @@ brew tap aljoscha/ember https://github.com/aljoscha/ember
 brew install ember
 ```
 
-This installs both `ember` and `ember-vz` (the Swift helper for Apple Virtualization Framework), plus runtime dependencies (`e2fsprogs`, `skopeo`). Requires macOS 13+ (Ventura) and Xcode Command Line Tools.
+This installs both `ember` and `ember-vz` (the Swift helper for Apple Virtualization Framework), plus runtime dependencies (`e2fsprogs`, `skopeo`, `fakeroot`, `gnu-tar`). Requires macOS 13+ (Ventura) and Xcode Command Line Tools.
 
 To install the latest development version instead of a tagged release:
 
@@ -66,7 +66,7 @@ ember ssh myvm
 
 No `sudo` needed. State is stored in `~/Library/Application Support/ember/`. Storage uses instant APFS copy-on-write clones — creating VMs and snapshots takes milliseconds regardless of disk size.
 
-The kernel build requires Docker or Podman and enables Docker networking inside your VMs. It only needs to run once — the kernel is cached for all future VMs. If you don't need Docker inside VMs, skip the `kernel build` step and the stock kernel will be auto-downloaded on first use.
+The kernel build requires Docker or Podman. It only needs to run once — the kernel is cached for all future VMs. On macOS, `kernel build` is required — the stock Firecracker kernel is not compatible with Apple Virtualization Framework.
 
 ### Linux
 
@@ -98,7 +98,7 @@ The default image (`ubuntu-dev`) is Ubuntu 26.04 with systemd, sshd, and a devel
 # Build from a custom Dockerfile
 ember image build myimage -f ./Dockerfile
 
-# Pull a minimal image from an OCI registry
+# Pull a minimal image from an OCI registry (no SSH — use `ember image build` for SSH access)
 ember image pull docker.io/library/alpine:latest
 ```
 
