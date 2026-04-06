@@ -6,6 +6,7 @@ pub mod image;
 pub mod info;
 pub mod init;
 pub mod kernel;
+pub mod pool;
 pub mod snapshot;
 pub mod ssh;
 pub mod vm;
@@ -54,6 +55,10 @@ pub enum Command {
     /// Manage virtual machines
     #[command(subcommand)]
     Vm(vm::VmCommand),
+
+    /// Manage VM pools
+    #[command(subcommand)]
+    Pool(pool::PoolCommand),
 
     /// Manage images
     #[command(subcommand)]

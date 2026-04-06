@@ -359,7 +359,7 @@ fn resolve_create_config(
 }
 
 /// Resolve the kernel path: CLI/YAML spec → global config → auto-download default preset.
-fn ensure_kernel(
+pub(crate) fn ensure_kernel(
     cli_kernel: &Option<crate::kernel::KernelSpec>,
     config: &mut GlobalConfig,
     store: &StateStore,

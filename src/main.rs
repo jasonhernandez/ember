@@ -16,6 +16,7 @@ pub mod zfs;
 use clap::Parser;
 #[cfg(target_os = "linux")]
 use cli::kernel::KernelCommand;
+use cli::pool::PoolCommand;
 use cli::vm::VmCommand;
 use cli::{Cli, Command};
 
@@ -48,6 +49,7 @@ fn needs_root(command: &Command) -> bool {
             | Command::Exec(_)
             | Command::Cp(_)
             | Command::Vm(VmCommand::List(_) | VmCommand::Inspect(_))
+            | Command::Pool(PoolCommand::List(_) | PoolCommand::Status(_))
             | Command::Kernel(KernelCommand::List)
     )
 }
@@ -68,6 +70,7 @@ fn needs_reconcile(command: &Command) -> bool {
             | Command::Exec(_)
             | Command::Cp(_)
             | Command::Vm(VmCommand::List(_) | VmCommand::Inspect(_))
+            | Command::Pool(PoolCommand::List(_) | PoolCommand::Status(_))
             | Command::Kernel(_)
     )
 }
@@ -97,6 +100,7 @@ fn main() -> anyhow::Result<()> {
     match &cli.command {
         Command::Init(args) => cli::init::run(args, &cli.state_dir),
         Command::Vm(cmd) => cli::vm::run(cmd, &cli.state_dir),
+        Command::Pool(cmd) => cli::pool::run(cmd, &cli.state_dir),
         Command::Image(cmd) => cli::image::run(cmd, &cli.state_dir),
         Command::Kernel(cmd) => cli::kernel::run(cmd, &cli.state_dir),
         Command::Snapshot(cmd) => cli::snapshot::run(cmd, &cli.state_dir),

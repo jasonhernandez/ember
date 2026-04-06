@@ -111,7 +111,7 @@ impl KernelSpec {
                         dest.display()
                     )
                 })?;
-                println!("Copied kernel {} → {}", src.display(), dest.display());
+                eprintln!("Copied kernel {} → {}", src.display(), dest.display());
                 Ok(dest)
             }
             KernelSpec::Preset(preset) => {

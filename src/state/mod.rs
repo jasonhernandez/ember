@@ -4,5 +4,6 @@
 pub mod reconcile;
 #[cfg(target_os = "macos")]
 pub mod reconcile_macos;
+pub mod pool;
 pub mod store;
 pub mod vm;

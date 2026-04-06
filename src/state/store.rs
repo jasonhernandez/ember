@@ -65,6 +65,7 @@ impl StateStore {
             self.kernel_dir(),
             self.root.join("images"),
             self.root.join("vms"),
+            self.root.join("pools"),
             self.root.join("network"),
         ];
         for dir in &dirs {
