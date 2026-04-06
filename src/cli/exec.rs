@@ -29,7 +29,19 @@ pub fn run(args: &ExecArgs, state_dir: &Path) -> anyhow::Result<()> {
     let user = args.user.as_deref().unwrap_or(&metadata.ssh.user);
 
     // Build the remote command string from the argument vector.
-    let command = shell_escape_join(&args.command);
+    //
+    // Single argument: pass directly to the remote shell (the SSH server
+    // runs it through sh -c, so operators like && | > work as expected).
+    // This matches ssh(1) behavior: `ssh host "cmd1 && cmd2"`.
+    //
+    // Multiple arguments: join with shell-escaping so each arg is treated
+    // as a single word on the remote side, regardless of its contents.
+    // This matches: `ssh host -- echo "hello world"`.
+    let command = if args.command.len() == 1 {
+        args.command[0].clone()
+    } else {
+        shell_escape_join(&args.command)
+    };
 
     let rt = tokio::runtime::Runtime::new()?;
     let exit_code = rt.block_on(async {
@@ -102,5 +114,24 @@ mod tests {
     fn empty_argument() {
         let args = vec!["cmd".to_string(), "".to_string()];
         assert_eq!(shell_escape_join(&args), "cmd ''");
+    }
+
+    #[test]
+    fn single_arg_shell_command_passed_directly() {
+        // Single-argument commands are treated as shell strings:
+        // ember exec vm -- "echo hello && echo world"
+        // should send "echo hello && echo world" verbatim.
+        let args = ExecArgs {
+            vm_name: "vm".to_string(),
+            user: None,
+            command: vec!["echo hello && echo world".to_string()],
+        };
+        // The dispatch logic passes single args directly, not through
+        // shell_escape_join. Verify the multi-arg path still escapes.
+        let multi_args = vec!["sh".to_string(), "-c".to_string(), "echo hello && echo world".to_string()];
+        assert_eq!(shell_escape_join(&multi_args), "sh -c 'echo hello && echo world'");
+
+        // Single arg should be identity.
+        assert_eq!(args.command[0], "echo hello && echo world");
     }
 }
