@@ -320,7 +320,8 @@ fn destroy(args: &DestroyArgs, state_dir: &Path) -> anyhow::Result<()> {
     for pool_vm in &pool_state.vms {
         if vm::exists(&store, &pool_vm.vm_name) {
             let delete_args = super::vm::DeleteArgs {
-                name: pool_vm.vm_name.clone(),
+                name: Some(pool_vm.vm_name.clone()),
+                all: false,
                 force: true,
             };
             // Ignore errors from individual VM deletions — best effort cleanup.
