@@ -30,9 +30,6 @@ use crate::error::{Error, Result};
 /// │       ├── firecracker.log
 /// │       ├── console.log
 /// │       └── firecracker.pid
-/// ├── pools/
-/// │   └── <pool-name>/
-/// │       └── pool.json
 /// └── network/
 ///     └── allocations.json
 /// ```
@@ -68,7 +65,6 @@ impl StateStore {
             self.kernel_dir(),
             self.root.join("images"),
             self.root.join("vms"),
-            self.root.join("pools"),
             self.root.join("network"),
         ];
         for dir in &dirs {

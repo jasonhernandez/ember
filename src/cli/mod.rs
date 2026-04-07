@@ -6,7 +6,6 @@ pub mod image;
 pub mod info;
 pub mod init;
 pub mod kernel;
-pub mod pool;
 pub mod snapshot;
 pub mod ssh;
 pub mod vm;
@@ -63,10 +62,6 @@ pub enum Command {
     /// Build and manage kernels
     #[command(subcommand)]
     Kernel(kernel::KernelCommand),
-
-    /// Manage VM pools for bulk task assignment
-    #[command(subcommand)]
-    Pool(pool::PoolCommand),
 
     /// Manage VM snapshots
     #[command(subcommand)]

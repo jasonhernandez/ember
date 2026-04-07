@@ -69,18 +69,6 @@ pub enum Error {
         expected: String,
     },
 
-    /// Pool not found.
-    #[error("pool '{name}' not found — run 'ember pool list' to see available pools")]
-    PoolNotFound { name: String },
-
-    /// No available VMs in the pool.
-    #[error("pool '{name}' has no available VMs — all are assigned or completed")]
-    PoolFull { name: String },
-
-    /// VM is not a member of the specified pool.
-    #[error("vm '{vm_name}' is not in pool '{pool_name}'")]
-    VmNotInPool { vm_name: String, pool_name: String },
-
     /// Root privileges required.
     #[error("this operation requires root privileges")]
     RootRequired,
