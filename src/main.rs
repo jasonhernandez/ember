@@ -97,6 +97,7 @@ fn main() -> anyhow::Result<()> {
     match &cli.command {
         Command::Init(args) => cli::init::run(args, &cli.state_dir),
         Command::Vm(cmd) => cli::vm::run(cmd, &cli.state_dir),
+        Command::Pool(cmd) => cli::pool::run(cmd, &cli.state_dir),
         Command::Image(cmd) => cli::image::run(cmd, &cli.state_dir),
         Command::Kernel(cmd) => cli::kernel::run(cmd, &cli.state_dir),
         Command::Snapshot(cmd) => cli::snapshot::run(cmd, &cli.state_dir),
