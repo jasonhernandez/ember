@@ -6,3 +6,4 @@ pub mod reconcile;
 pub mod reconcile_macos;
 pub mod store;
 pub mod vm;
+pub mod vsock;
