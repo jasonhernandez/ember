@@ -12,6 +12,7 @@
 
 use std::io::{BufRead, BufReader};
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -35,6 +36,15 @@ const BASE_BOOT_ARGS: &str = "console=hvc0 root=/dev/vda rw";
 /// AVF boot is typically fast (a few seconds), but allow headroom for
 /// slow disks or large kernels.
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How many bytes from the tail of `ember-vz.log` to include when the helper
+/// closes the ready-fd without reporting success. Kept small so the error
+/// message remains readable but big enough to capture typical AVF errors
+/// (2–3 lines).
+const EMBER_VZ_LOG_TAIL_BYTES: u64 = 2048;
+
+/// Backoff before retrying `MacosVm::start` after a transient failure.
+const START_RETRY_BACKOFF: Duration = Duration::from_secs(2);
 
 /// Name of the Swift helper binary.
 const EMBER_VZ_BIN: &str = "ember-vz";
@@ -72,22 +82,18 @@ const FORCE_KILL_TIMEOUT: Duration = Duration::from_secs(5);
 /// Polling interval when waiting for a process to exit.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-impl VmBackend for MacosVm {
-    /// Start a VM by spawning the `ember-vz` helper process.
+impl MacosVm {
+    /// Single attempt to spawn `ember-vz` and read back the guest MAC.
     ///
-    /// Creates a pipe for ready-fd communication, spawns `ember-vz start`
-    /// with the VM's kernel, disk image, CPU/memory config, and boot args.
-    /// Waits for the helper to write the guest MAC address to the pipe,
-    /// indicating the VM has booted successfully.
-    ///
-    /// Returns the helper's PID and a NetworkInfo containing the guest MAC.
-    /// Guest IP discovery (via vmnet DHCP leases) is handled separately
-    /// by the network backend.
-    fn start(vm: &VmMetadata, config: &GlobalConfig) -> Result<StartedVm> {
-        // Derive paths for the VM's serial console log.
-        // The log lives next to vm.json in the VM directory.
+    /// Callers must tolerate transient failures — see [`<MacosVm as VmBackend>::start`]
+    /// for the retry wrapper. On any error path this function is responsible
+    /// for killing the helper process it spawned (so no orphan ember-vz lingers).
+    fn start_once(vm: &VmMetadata, config: &GlobalConfig) -> Result<StartedVm> {
+        // Derive paths for the VM's serial console log and helper stderr log.
+        // Both live next to vm.json in the VM directory.
         let vm_dir = config.state_dir.join("vms").join(&vm.name);
         let serial_log = vm_dir.join("console.log");
+        let ember_vz_log = vm_dir.join("ember-vz.log");
 
         // Build boot args with static IP from the network setup.
         let boot_args = build_boot_args(vm);
@@ -166,8 +172,10 @@ impl VmBackend for MacosVm {
         drop(write_file);
 
         // Read the MAC address from the ready-fd pipe.
-        // ember-vz writes "<MAC>\n" once the VM has booted.
-        let mac = match read_mac_from_ready_fd(read_file, READY_TIMEOUT) {
+        // ember-vz writes "<MAC>\n" on success or "ERR <message>\n" on
+        // failure. We pass the ember-vz.log path so a generic EOF (neither
+        // marker present) can be annotated with the helper's stderr tail.
+        let mac = match read_mac_from_ready_fd(read_file, READY_TIMEOUT, &ember_vz_log) {
             Ok(mac) => mac,
             Err(e) => {
                 // Boot failed or timed out — kill the orphaned helper.
@@ -202,6 +210,47 @@ impl VmBackend for MacosVm {
         };
 
         Ok(StartedVm { pid, network })
+    }
+}
+
+impl VmBackend for MacosVm {
+    /// Start a VM by spawning the `ember-vz` helper process.
+    ///
+    /// Creates a pipe for ready-fd communication, spawns `ember-vz start`
+    /// with the VM's kernel, disk image, CPU/memory config, and boot args.
+    /// Waits for the helper to write the guest MAC address to the pipe,
+    /// indicating the VM has booted successfully.
+    ///
+    /// Returns the helper's PID and a NetworkInfo containing the guest MAC.
+    /// Guest IP discovery (via vmnet DHCP leases) is handled separately
+    /// by the network backend.
+    ///
+    /// **Retry behaviour.** AVF occasionally reports a transient failure
+    /// ("ember-vz closed ready-fd without writing MAC address") under
+    /// host-level resource pressure — e.g. when several VMs are spawned
+    /// concurrently on a laptop. We retry once after a short backoff.
+    /// Errors that Swift explicitly reported (see ERR marker handling in
+    /// [`read_mac_from_ready_fd`]) are treated as permanent and not retried.
+    ///
+    /// **Isolation.** Failure of this call only rolls back the resources
+    /// this call allocated (the spawned ember-vz process). Unrelated VMs
+    /// running on the host are never touched; rollback is driven by the
+    /// [`crate::cleanup::Rollback`] guard in [`crate::cli::vm::start`]
+    /// which only registers per-VM teardowns.
+    fn start(vm: &VmMetadata, config: &GlobalConfig) -> Result<StartedVm> {
+        match Self::start_once(vm, config) {
+            Ok(started) => Ok(started),
+            Err(e) if is_transient_start_error(&e) => {
+                eprintln!(
+                    "warning: VM '{}' start failed transiently ({e}); retrying once in {}s...",
+                    vm.name,
+                    START_RETRY_BACKOFF.as_secs()
+                );
+                std::thread::sleep(START_RETRY_BACKOFF);
+                Self::start_once(vm, config)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Graceful stop: send SIGTERM to ember-vz, wait for exit, SIGKILL fallback.
@@ -340,12 +389,30 @@ fn build_boot_args(vm: &VmMetadata) -> String {
     }
 }
 
+/// Marker the Swift helper writes when `VZVirtualMachine.start` fails, so
+/// the real VZ error surfaces to the parent instead of an opaque EOF.
+/// Must match [`EmberVZ.Start.writeErrorToReadyFd`] in Start.swift.
+const ERR_MARKER_PREFIX: &str = "ERR ";
+
 /// Read the guest MAC address from the ready-fd pipe with a timeout.
 ///
-/// The ember-vz helper writes `<MAC>\n` to the pipe once the VM has
-/// successfully booted. We use a poll-based approach with a timeout
-/// to avoid blocking forever if the VM fails to start.
-fn read_mac_from_ready_fd(read_file: std::fs::File, timeout: Duration) -> Result<String> {
+/// Three possible outcomes on the wire:
+/// * `<MAC>\n` — VM booted, return the MAC.
+/// * `ERR <message>\n` — Swift helper reported a failure (see
+///   [`ERR_MARKER_PREFIX`]). The message is propagated verbatim in a
+///   [`Error::Vm`] so operators see the real VZ error.
+/// * empty read / EOF — helper crashed before writing anything. We tail
+///   `ember-vz.log` and include its last bytes in the error so the user
+///   does not have to hunt for the file.
+///
+/// `log_path` is the path to the helper's stderr log (`ember-vz.log` in
+/// the VM's state dir). It is read only on the EOF path; callers pass it
+/// unconditionally.
+fn read_mac_from_ready_fd(
+    read_file: std::fs::File,
+    timeout: Duration,
+    log_path: &Path,
+) -> Result<String> {
     // Use poll() to wait for data with a timeout, so we don't block
     // forever if ember-vz crashes before writing the MAC.
     let mut pollfd = libc::pollfd {
@@ -366,24 +433,255 @@ fn read_mac_from_ready_fd(read_file: std::fs::File, timeout: Duration) -> Result
     }
     if poll_result == 0 {
         return Err(Error::Vm(format!(
-            "timed out waiting for ember-vz to report VM readiness ({}s)",
-            timeout.as_secs()
+            "timed out waiting for ember-vz to report VM readiness ({}s); {}",
+            timeout.as_secs(),
+            format_log_tail(log_path)
         )));
     }
 
-    // Data is available — read the MAC address line.
+    // Data is available — read the first line.
     let mut reader = BufReader::new(read_file);
     let mut line = String::new();
     reader
         .read_line(&mut line)
-        .map_err(|e| Error::Vm(format!("failed to read MAC from ready-fd: {e}")))?;
+        .map_err(|e| Error::Vm(format!("failed to read from ready-fd: {e}")))?;
 
-    let mac = line.trim().to_string();
-    if mac.is_empty() {
-        return Err(Error::Vm(
-            "ember-vz closed ready-fd without writing MAC address (VM may have crashed)".into(),
-        ));
+    classify_ready_fd_line(&line, log_path)
+}
+
+/// Parse a single line read from the ready-fd pipe into either the guest
+/// MAC (success) or a structured error. Extracted from
+/// [`read_mac_from_ready_fd`] so the parse logic is testable without
+/// setting up a real pipe + poll loop.
+fn classify_ready_fd_line(line: &str, log_path: &Path) -> Result<String> {
+    let trimmed = line.trim_end_matches(['\n', '\r']);
+
+    // Swift-reported failure: propagate the real message verbatim.
+    if let Some(msg) = trimmed.strip_prefix(ERR_MARKER_PREFIX) {
+        return Err(Error::Vm(format!("ember-vz failed to start VM: {msg}")));
     }
 
-    Ok(mac)
+    if trimmed.is_empty() {
+        // No marker, no MAC — helper crashed silently. Tail the log so the
+        // operator sees the actual failure without additional archaeology.
+        return Err(Error::Vm(format!(
+            "ember-vz closed ready-fd without writing MAC address (VM may have crashed); {}",
+            format_log_tail(log_path)
+        )));
+    }
+
+    Ok(trimmed.to_string())
+}
+
+/// Return the tail of `ember-vz.log` formatted for inclusion in an error
+/// message. Reads at most [`EMBER_VZ_LOG_TAIL_BYTES`] from the end of the
+/// file and strips leading partial lines.
+///
+/// Returns a best-effort human-readable string, never an error — if the
+/// log is missing, unreadable, or empty, returns a short placeholder. The
+/// caller is already surfacing one error; this is supporting detail.
+fn format_log_tail(log_path: &Path) -> String {
+    match read_log_tail(log_path, EMBER_VZ_LOG_TAIL_BYTES) {
+        Ok(tail) if !tail.is_empty() => {
+            format!("ember-vz.log (tail):\n{tail}")
+        }
+        Ok(_) => format!("ember-vz.log ({}) is empty", log_path.display()),
+        Err(e) => format!("ember-vz.log ({}) unreadable: {e}", log_path.display()),
+    }
+}
+
+/// Read at most `max_bytes` from the end of `path` and return as UTF-8
+/// (lossy). Drops the first partial line so the output starts at a clean
+/// line boundary.
+fn read_log_tail(path: &Path, max_bytes: u64) -> std::io::Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut f = std::fs::File::open(path)?;
+    let size = f.metadata()?.len();
+    let start = size.saturating_sub(max_bytes);
+    f.seek(SeekFrom::Start(start))?;
+    let mut buf = Vec::with_capacity(max_bytes as usize);
+    f.take(max_bytes).read_to_end(&mut buf)?;
+    let text = String::from_utf8_lossy(&buf).into_owned();
+
+    // If we seeked mid-file, the first line is probably truncated — drop it
+    // so the tail begins at a clean boundary. If we read the whole file,
+    // keep everything.
+    if start > 0 {
+        if let Some(nl) = text.find('\n') {
+            return Ok(text[nl + 1..].to_string());
+        }
+    }
+    Ok(text)
+}
+
+/// Classify a [`MacosVm::start_once`] error as transient (retry once) vs
+/// permanent (propagate immediately). Transient signatures are the ones
+/// that AVF has been observed to emit under host resource pressure; they
+/// are pattern-matched on the error message since [`Error`] does not
+/// encode a structured kind.
+///
+/// Permanent failures — including anything Swift reported via the
+/// [`ERR_MARKER_PREFIX`] marker — must not retry. A retried config error
+/// would waste time and mask the real cause in logs.
+fn is_transient_start_error(err: &Error) -> bool {
+    let msg = match err {
+        Error::Vm(msg) => msg,
+        _ => return false,
+    };
+
+    // Errors we treat as transient (observed during concurrent pool starts
+    // on macOS laptops — see SEC-345 for the incident that motivated this).
+    const TRANSIENT_SIGNATURES: &[&str] = &[
+        "ember-vz closed ready-fd without writing MAC address",
+        "timed out waiting for ember-vz to report VM readiness",
+    ];
+
+    // Never retry a Swift-reported failure, even if the text happens to
+    // contain a transient substring — the helper already made a
+    // determination and we respect it.
+    if msg.contains("ember-vz failed to start VM:") {
+        return false;
+    }
+
+    TRANSIENT_SIGNATURES.iter().any(|sig| msg.contains(sig))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Convenience: path to a guaranteed-missing log file, so
+    /// `format_log_tail` returns its "unreadable" branch and tests don't
+    /// need real filesystem setup unless they care about the tail content.
+    fn dummy_log_path() -> std::path::PathBuf {
+        std::path::PathBuf::from("/nonexistent/ember-vz.log")
+    }
+
+    #[test]
+    fn classify_mac_line_returns_mac() {
+        let result = classify_ready_fd_line("f2:ef:2a:59:bf:8d\n", &dummy_log_path()).unwrap();
+        assert_eq!(result, "f2:ef:2a:59:bf:8d");
+    }
+
+    #[test]
+    fn classify_mac_with_crlf() {
+        let result = classify_ready_fd_line("aa:bb:cc:dd:ee:ff\r\n", &dummy_log_path()).unwrap();
+        assert_eq!(result, "aa:bb:cc:dd:ee:ff");
+    }
+
+    #[test]
+    fn classify_err_marker_surfaces_message() {
+        let err = classify_ready_fd_line(
+            "ERR The virtual machine failed to start because insufficient memory.\n",
+            &dummy_log_path(),
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("ember-vz failed to start VM:"), "got: {msg}");
+        assert!(
+            msg.contains("insufficient memory"),
+            "real VZ message lost: {msg}"
+        );
+    }
+
+    #[test]
+    fn classify_empty_line_reports_crash_and_tails_log() {
+        // Create a real temp log file so the tail appears in the error.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        writeln!(tmp.as_file(), "vm started").unwrap();
+        writeln!(tmp.as_file(), "unexpected eof from vmnet").unwrap();
+
+        let err = classify_ready_fd_line("", tmp.path()).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("closed ready-fd without writing MAC address"),
+            "got: {msg}"
+        );
+        assert!(
+            msg.contains("unexpected eof from vmnet"),
+            "log tail missing: {msg}"
+        );
+    }
+
+    #[test]
+    fn is_transient_matches_known_signatures() {
+        let eof_err = Error::Vm(
+            "ember-vz closed ready-fd without writing MAC address (VM may have crashed)".into(),
+        );
+        assert!(is_transient_start_error(&eof_err));
+
+        let timeout_err = Error::Vm(
+            "timed out waiting for ember-vz to report VM readiness (30s); log unreadable".into(),
+        );
+        assert!(is_transient_start_error(&timeout_err));
+    }
+
+    #[test]
+    fn is_transient_rejects_swift_reported_errors() {
+        let swift_err = Error::Vm("ember-vz failed to start VM: kernel image not found".into());
+        assert!(
+            !is_transient_start_error(&swift_err),
+            "Swift-reported errors must never retry"
+        );
+    }
+
+    #[test]
+    fn is_transient_rejects_permanent_errors() {
+        let config_err = Error::Config("bad kernel path".into());
+        assert!(!is_transient_start_error(&config_err));
+
+        let other_vm_err = Error::Vm("pipe: EMFILE: too many open files".into());
+        assert!(!is_transient_start_error(&other_vm_err));
+    }
+
+    #[test]
+    fn log_tail_empty_file_returns_empty_text() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let result = read_log_tail(tmp.path(), 2048).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn log_tail_smaller_than_limit_returns_whole_file() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        writeln!(tmp.as_file(), "line1").unwrap();
+        writeln!(tmp.as_file(), "line2").unwrap();
+
+        let result = read_log_tail(tmp.path(), 2048).unwrap();
+        assert!(result.contains("line1"));
+        assert!(result.contains("line2"));
+    }
+
+    #[test]
+    fn log_tail_larger_than_limit_drops_leading_partial_line() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        // Write enough that we'll seek past the first line.
+        for i in 0..500 {
+            writeln!(tmp.as_file(), "log line number {i} with some padding text").unwrap();
+        }
+
+        let result = read_log_tail(tmp.path(), 256).unwrap();
+        // First line should not start mid-word — the partial-line trimmer
+        // drops everything up to the first `\n`.
+        assert!(
+            !result.starts_with("umber") && !result.starts_with("adding"),
+            "partial-line prefix leaked through: {result:?}"
+        );
+        // Tail should contain the final entries.
+        assert!(
+            result.contains("499"),
+            "expected final log line in tail: {result}"
+        );
+    }
+
+    #[test]
+    fn log_tail_missing_file_surfaces_via_format_log_tail() {
+        let placeholder = format_log_tail(&dummy_log_path());
+        assert!(
+            placeholder.contains("unreadable"),
+            "expected 'unreadable' placeholder for missing log: {placeholder}"
+        );
+    }
 }

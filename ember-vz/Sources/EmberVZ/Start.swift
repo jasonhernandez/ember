@@ -48,7 +48,16 @@ struct Start: ParsableCommand {
 
     func run() throws {
         // Build the VM configuration (does not require main actor)
-        let vmConfig = try buildConfiguration()
+        let vmConfig: VZVirtualMachineConfiguration
+        do {
+            vmConfig = try buildConfiguration()
+        } catch {
+            // Surface config errors to the parent via ready-fd before exiting
+            // so it sees "ERR <reason>" instead of "closed without MAC".
+            writeErrorToReadyFd(message: error.localizedDescription)
+            fputs("error: \(error.localizedDescription)\n", stderr)
+            Darwin.exit(1)
+        }
 
         // Schedule VM creation and start on the main queue.
         // VZVirtualMachine must be used from the queue it was created on
@@ -57,6 +66,7 @@ struct Start: ParsableCommand {
             do {
                 try self.startVM(config: vmConfig)
             } catch {
+                self.writeErrorToReadyFd(message: error.localizedDescription)
                 fputs("error: \(error.localizedDescription)\n", stderr)
                 Darwin.exit(1)
             }
@@ -65,6 +75,23 @@ struct Start: ParsableCommand {
         // Block forever on the main run loop. The VM delegate calls exit()
         // when the guest shuts down or an error occurs.
         dispatchMain()
+    }
+
+    /// Write an error marker to the ready-fd pipe so the parent (ember) can
+    /// surface the actual VZ failure reason instead of a generic "closed
+    /// without MAC" error. Format: `ERR <single-line message>\n`.
+    ///
+    /// No-op if `--ready-fd` was not provided.
+    fileprivate func writeErrorToReadyFd(message: String) {
+        guard let fd = readyFd else { return }
+        // Sanitize so the payload is a single line — the Rust reader uses
+        // read_line and relies on `\n` as the record terminator.
+        let sanitized = message
+            .replacingOccurrences(of: "\r", with: " ")
+            .replacingOccurrences(of: "\n", with: " | ")
+        let payload = "ERR \(sanitized)\n"
+        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+        try? handle.write(contentsOf: Data(payload.utf8))
     }
 
     // MARK: - VM Configuration
@@ -299,6 +326,12 @@ struct Start: ParsableCommand {
                 }
 
             case .failure(let error):
+                // Surface the real VZ error to the parent via ready-fd. This
+                // is the path users hit on transient AVF failures (e.g.
+                // resource pressure from too many concurrent VMs); without
+                // the marker they see only "closed ready-fd without writing
+                // MAC address" and have to dig through ember-vz.log.
+                self.writeErrorToReadyFd(message: error.localizedDescription)
                 fputs("error: vm failed to start: \(error.localizedDescription)\n", stderr)
                 Darwin.exit(1)
             }
