@@ -1,11 +1,12 @@
 //! SQLite-backed allocator state.
 //!
-//! Replaces the prior `network/allocations.json` and `vsock/cids.json` files
-//! with a single `state.db` SQLite database. Schema constraints (PRIMARY KEY
-//! and UNIQUE) make double-allocation structurally impossible — the second
-//! `INSERT` for the same slot fails with a constraint violation, so the
-//! allocator code can't accidentally hand out the same IP/CID twice even if
-//! the read-modify-write logic regresses.
+//! Replaces the prior `network/allocations.json` file with a `state.db`
+//! SQLite database. Schema constraints (PRIMARY KEY and UNIQUE) make
+//! double-allocation structurally impossible — the second `INSERT` for the
+//! same slot fails with a constraint violation, so the allocator code can't
+//! accidentally hand out the same IP twice even if the read-modify-write
+//! logic regresses. Future allocators (e.g. vsock CID, when that lands)
+//! should add their own table to this same database.
 //!
 //! See SEC-459 for the original TOCTOU bug this replaces. The flock-based
 //! JSON store had per-call (not per-transaction) locking; six parallel
@@ -55,10 +56,15 @@ pub fn db_path(root: &Path) -> PathBuf {
 pub fn open(root: &Path) -> Result<Connection> {
     let path = db_path(root);
     let conn = Connection::open(&path)?;
-    conn.pragma_update(None, "journal_mode", "WAL")?;
+    // Set busy_timeout BEFORE the WAL conversion: the first time a fresh
+    // database is opened, `journal_mode=WAL` performs a one-time conversion
+    // that briefly takes a write lock. If two processes race the first
+    // open, one would otherwise see SQLITE_BUSY without retry. After the
+    // first conversion, the pragma is a no-op.
     // 5s busy timeout is enough for normal contention on a laptop pool;
     // contended writes serialize behind a held write lock.
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.execute_batch(SCHEMA)?;
     Ok(conn)
 }

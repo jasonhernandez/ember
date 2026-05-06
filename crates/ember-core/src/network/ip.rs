@@ -401,7 +401,10 @@ mod tests {
     // --- Concurrency stress test (SEC-459 regression) ---
 
     /// Spawn N OS threads, each calling `allocate()` against a shared store
-    /// with a distinct VM name. After all threads finish, assert:
+    /// with a distinct VM name. A `Barrier` makes all threads enter
+    /// `BEGIN IMMEDIATE` near-simultaneously — without it, the threads can
+    /// serialize on scheduler luck and never actually exercise the race
+    /// window. After all threads finish, assert:
     ///
     ///   - every call returned `Ok`
     ///   - every returned `block_index` is unique
@@ -414,7 +417,7 @@ mod tests {
     /// read or write call, not the read-modify-write transaction.
     #[test]
     fn parallel_allocate_produces_unique_slots() {
-        use std::sync::Arc;
+        use std::sync::{Arc, Barrier};
         use std::thread;
 
         const N: usize = 50;
@@ -423,11 +426,17 @@ mod tests {
         let store = StateStore::new(dir.path().to_path_buf());
         store.init().unwrap();
         let store = Arc::new(store);
+        let barrier = Arc::new(Barrier::new(N));
 
         let mut handles = Vec::with_capacity(N);
         for i in 0..N {
             let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
             handles.push(thread::spawn(move || {
+                // Wait until every thread has reached this point, then race
+                // into `allocate()` together. This forces actual contention
+                // on `BEGIN IMMEDIATE` instead of relying on scheduler luck.
+                barrier.wait();
                 allocate(&store, "10.100.0.0/16", &format!("vm{i}")).unwrap()
             }));
         }
