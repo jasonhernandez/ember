@@ -416,7 +416,7 @@ fn read_last_lines(path: &std::path::Path, n: usize) -> Vec<String> {
     lines[start..].iter().map(|s| s.to_string()).collect()
 }
 
-/// Copy `log_path` to `<state_dir>/failed-starts/<vm_name>-<unix_ts>.log`.
+/// Copy `log_path` to `<state_dir>/failed-starts/<vm_name>-<secs>-<nanos>.log`.
 ///
 /// Creates the `failed-starts` directory if it does not exist.  Returns the
 /// destination path on success, or `None` if the copy fails (e.g. the log
