@@ -122,6 +122,15 @@ fn pull(args: &PullArgs, state_dir: &Path) -> anyhow::Result<()> {
         &CurrentPlatform::image_tool_config(),
     )?;
 
+    // Warn if the image has no SSH server — Ember needs one to connect.
+    if !ember_core::image::inspect::rootfs_has_ssh_server(&rootfs_dir) {
+        eprintln!("warning: image '{reference}' has no SSH server (sshd/dropbear).");
+        eprintln!("hint: Ember connects to VMs over SSH; without an SSH server the VM");
+        eprintln!("hint: will boot but you won't be able to `ember exec` or `ember ssh`.");
+        eprintln!("hint: Install sshd in your image, or pull a base that already has it");
+        eprintln!("hint: (e.g. ubuntu-dev).");
+    }
+
     // Step 2: Inject SSH authorized_keys, resolv.conf, and inittab into rootfs.
     inject_image_config(&rootfs_dir, true)?;
 
