@@ -4,7 +4,7 @@
 //! (testing) and serves JSON-lines requests. Matches the protocol expected
 //! by Thermite's `EmberdClient` (`daemon_client.py`).
 //!
-//! Operations: ping, exec, read_file, write_file, agent_status.
+//! Operations: ping, exec, read_file, write_file, agent_status, vm_stats.
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use clap::Parser;
@@ -160,6 +160,7 @@ fn dispatch(req: &Value) -> Value {
         "read_file" => op_read_file(req),
         "write_file" => op_write_file(req),
         "agent_status" => op_agent_status(),
+        "vm_stats" => op_vm_stats(),
         _ => json!({"error": format!("unknown op: {op}")}),
     }
 }
@@ -250,6 +251,150 @@ fn op_agent_status() -> Value {
             "task_id": null,
         }),
     }
+}
+
+fn op_vm_stats() -> Value {
+    let cpu_pct = measure_cpu_pct();
+    let (memory_used_mb, memory_total_mb) = read_memory_mb().unwrap_or((0, 0));
+    let disk_used_gb = read_disk_used_gb().unwrap_or(0.0);
+    let (net_rx_bytes, net_tx_bytes) = read_net_bytes().unwrap_or((0, 0));
+
+    json!({
+        "cpu_pct": cpu_pct,
+        "memory_used_mb": memory_used_mb,
+        "memory_total_mb": memory_total_mb,
+        "disk_used_gb": disk_used_gb,
+        "net_rx_bytes": net_rx_bytes,
+        "net_tx_bytes": net_tx_bytes,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// vm_stats helpers
+// ---------------------------------------------------------------------------
+
+/// Raw CPU counters from /proc/stat's aggregate `cpu` line.
+#[derive(Clone, Copy, Default)]
+struct CpuSample {
+    total: u64,
+    idle: u64,
+}
+
+fn read_cpu_sample() -> Option<CpuSample> {
+    let content = std::fs::read_to_string("/proc/stat").ok()?;
+    for line in content.lines() {
+        // The aggregate line starts with "cpu " (with a space), not "cpu0" etc.
+        if !line.starts_with("cpu ") {
+            continue;
+        }
+        let nums: Vec<u64> = line
+            .split_whitespace()
+            .skip(1) // skip "cpu"
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        // Fields: user nice system idle iowait irq softirq steal guest guest_nice
+        if nums.len() < 4 {
+            return None;
+        }
+        let idle = nums[3] + nums.get(4).copied().unwrap_or(0); // idle + iowait
+        let total: u64 = nums.iter().sum();
+        return Some(CpuSample { total, idle });
+    }
+    None
+}
+
+/// Measure CPU utilisation by sampling /proc/stat twice with a 100 ms gap.
+/// Returns 0.0 if /proc/stat is unavailable or the delta is zero.
+fn measure_cpu_pct() -> f64 {
+    let s1 = read_cpu_sample().unwrap_or_default();
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let s2 = read_cpu_sample().unwrap_or_default();
+
+    let total_delta = s2.total.saturating_sub(s1.total);
+    let idle_delta = s2.idle.saturating_sub(s1.idle);
+
+    if total_delta == 0 {
+        return 0.0;
+    }
+    let busy = total_delta.saturating_sub(idle_delta);
+    (busy as f64 / total_delta as f64 * 100.0).clamp(0.0, 100.0)
+}
+
+/// Parse MemTotal and MemAvailable from /proc/meminfo.
+/// Returns (used_mb, total_mb).
+fn read_memory_mb() -> Option<(u64, u64)> {
+    let content = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let mut total_kb: Option<u64> = None;
+    let mut available_kb: Option<u64> = None;
+
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            total_kb = rest.split_whitespace().next().and_then(|s| s.parse().ok());
+        } else if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            available_kb = rest.split_whitespace().next().and_then(|s| s.parse().ok());
+        }
+        if total_kb.is_some() && available_kb.is_some() {
+            break;
+        }
+    }
+
+    let total_kb = total_kb?;
+    let available_kb = available_kb?;
+    let used_kb = total_kb.saturating_sub(available_kb);
+    Some((used_kb / 1024, total_kb / 1024))
+}
+
+/// Return disk used for / in whole gigabytes (float) via statvfs.
+fn read_disk_used_gb() -> Option<f64> {
+    #[cfg(target_os = "linux")]
+    {
+        use nix::sys::statvfs::statvfs;
+        let stat = statvfs("/").ok()?;
+        let block_size = stat.block_size() as u64;
+        let used_blocks = (stat.blocks() as u64).saturating_sub(stat.blocks_free() as u64);
+        let used_bytes = used_blocks * block_size;
+        Some(used_bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// Sum rx_bytes and tx_bytes across all non-loopback interfaces from /proc/net/dev.
+/// Returns (rx_bytes, tx_bytes).
+pub fn parse_net_dev(content: &str) -> (u64, u64) {
+    let mut rx: u64 = 0;
+    let mut tx: u64 = 0;
+
+    // /proc/net/dev has two header lines, then one line per interface.
+    for line in content.lines().skip(2) {
+        // Each line: "  iface: rx_bytes rx_pkts ... tx_bytes ..."
+        let Some(colon_pos) = line.find(':') else {
+            continue;
+        };
+        let iface = line[..colon_pos].trim();
+        if iface == "lo" {
+            continue;
+        }
+        let fields: Vec<u64> = line[colon_pos + 1..]
+            .split_whitespace()
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        // Column 0 = rx_bytes, column 8 = tx_bytes
+        if let Some(&r) = fields.first() {
+            rx = rx.saturating_add(r);
+        }
+        if let Some(&t) = fields.get(8) {
+            tx = tx.saturating_add(t);
+        }
+    }
+    (rx, tx)
+}
+
+fn read_net_bytes() -> Option<(u64, u64)> {
+    let content = std::fs::read_to_string("/proc/net/dev").ok()?;
+    Some(parse_net_dev(&content))
 }
 
 // ---------------------------------------------------------------------------
@@ -405,6 +550,81 @@ mod tests {
     fn missing_op() {
         let resp = dispatch(&json!({"hello": "world"}));
         assert!(resp["error"].as_str().unwrap().contains("unknown op"));
+    }
+
+    // -- vm_stats tests --
+
+    // /proc/net/dev columns after the colon:
+    // Receive (8): bytes packets errs drop fifo frame compressed multicast
+    // Transmit (8): bytes packets errs drop fifo colls carrier compressed
+    // tx_bytes is therefore at index 8 (0-indexed).
+
+    #[test]
+    fn parse_net_dev_sums_non_lo() {
+        let content = "Inter-|   Receive                                                |  Transmit\n\
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n\
+    lo:  1000      10    0    0    0     0          0         0  2000      20    0    0    0     0       0          0\n\
+  eth0: 10000     100    0    0    0     0          0         0 20000     200    0    0    0     0       0          0\n\
+  eth1:  5000      50    0    0    0     0          0         0  8000      80    0    0    0     0       0          0\n";
+        let (rx, tx) = parse_net_dev(content);
+        assert_eq!(rx, 15000);
+        assert_eq!(tx, 28000);
+    }
+
+    #[test]
+    fn parse_net_dev_no_interfaces() {
+        let content = "Inter-|   Receive                                                |  Transmit\n\
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n\
+    lo:  1000      10    0    0    0     0          0         0  2000      20    0    0    0     0       0          0\n";
+        let (rx, tx) = parse_net_dev(content);
+        assert_eq!(rx, 0);
+        assert_eq!(tx, 0);
+    }
+
+    #[test]
+    fn parse_net_dev_empty() {
+        let (rx, tx) = parse_net_dev("Inter-|\n face |\n");
+        assert_eq!(rx, 0);
+        assert_eq!(tx, 0);
+    }
+
+    #[test]
+    fn vm_stats_dispatch_returns_expected_fields() {
+        let resp = dispatch(&json!({"op": "vm_stats"}));
+        assert!(resp.get("cpu_pct").is_some(), "missing cpu_pct");
+        assert!(
+            resp.get("memory_used_mb").is_some(),
+            "missing memory_used_mb"
+        );
+        assert!(
+            resp.get("memory_total_mb").is_some(),
+            "missing memory_total_mb"
+        );
+        assert!(resp.get("disk_used_gb").is_some(), "missing disk_used_gb");
+        assert!(resp.get("net_rx_bytes").is_some(), "missing net_rx_bytes");
+        assert!(resp.get("net_tx_bytes").is_some(), "missing net_tx_bytes");
+        assert!(resp["cpu_pct"].as_f64().unwrap() >= 0.0);
+        assert!(resp["cpu_pct"].as_f64().unwrap() <= 100.0);
+    }
+
+    #[test]
+    fn read_cpu_sample_parses_proc_stat() {
+        // Verify that on Linux the sample returns non-zero totals.
+        if !std::path::Path::new("/proc/stat").exists() {
+            return;
+        }
+        let s = read_cpu_sample().expect("should parse /proc/stat");
+        assert!(s.total > 0, "total CPU ticks should be > 0");
+    }
+
+    #[test]
+    fn read_memory_mb_returns_positive() {
+        if !std::path::Path::new("/proc/meminfo").exists() {
+            return;
+        }
+        let (used, total) = read_memory_mb().expect("should parse /proc/meminfo");
+        assert!(total > 0, "total memory should be > 0");
+        assert!(used <= total, "used memory should be <= total");
     }
 
     // -- Integration test via UDS --

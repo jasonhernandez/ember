@@ -35,7 +35,7 @@ fn needs_root(command: &Command) -> bool {
             | Command::Ssh(_)
             | Command::Exec(_)
             | Command::Cp(_)
-            | Command::Vm(VmCommand::List(_) | VmCommand::Inspect(_))
+            | Command::Vm(VmCommand::List(_) | VmCommand::Inspect(_) | VmCommand::Stats(_))
             | Command::Kernel(KernelCommand::List)
     )
 }
@@ -55,7 +55,7 @@ fn needs_reconcile(command: &Command) -> bool {
             | Command::Ssh(_)
             | Command::Exec(_)
             | Command::Cp(_)
-            | Command::Vm(VmCommand::List(_) | VmCommand::Inspect(_))
+            | Command::Vm(VmCommand::List(_) | VmCommand::Inspect(_) | VmCommand::Stats(_))
             | Command::Kernel(_)
     )
 }

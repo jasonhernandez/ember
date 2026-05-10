@@ -71,6 +71,9 @@ pub enum VmCommand {
 
     /// Fork an existing VM into a new independent VM
     Fork(ForkArgs),
+
+    /// Show live resource usage stats (CPU, memory, disk, network) from inside the VM
+    Stats(StatsArgs),
 }
 
 #[derive(Args)]
@@ -271,6 +274,16 @@ pub enum OutputFormat {
     Json,
 }
 
+#[derive(Args)]
+pub struct StatsArgs {
+    /// VM name
+    pub name: String,
+
+    /// Output format
+    #[arg(long, default_value = "table")]
+    pub format: OutputFormat,
+}
+
 pub fn run(cmd: &VmCommand, state_dir: &Path) -> anyhow::Result<()> {
     match cmd {
         VmCommand::Create(args) => create(args, state_dir),
@@ -284,6 +297,7 @@ pub fn run(cmd: &VmCommand, state_dir: &Path) -> anyhow::Result<()> {
         VmCommand::List(args) => list(args, state_dir),
         VmCommand::Inspect(args) => inspect(args, state_dir),
         VmCommand::Fork(args) => fork(args, state_dir),
+        VmCommand::Stats(args) => stats(args, state_dir),
     }
 }
 
@@ -1529,6 +1543,71 @@ fn inspect(args: &InspectArgs, state_dir: &Path) -> anyhow::Result<()> {
             println!("SSH:");
             println!("  User:        {}", metadata.ssh.user);
             println!("  Key:         {}", metadata.ssh.key.display());
+        }
+    }
+
+    Ok(())
+}
+
+fn stats(args: &StatsArgs, state_dir: &Path) -> anyhow::Result<()> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+
+    let store = StateStore::new(state_dir.to_path_buf());
+    let metadata = vm::load(&store, &args.name)?;
+
+    let vsock = metadata.vsock.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "VM '{}' does not have vsock enabled.\n\
+             Hint: create or update the VM with --vsock to enable the emberd daemon.",
+            args.name
+        )
+    })?;
+
+    let mut stream = UnixStream::connect(&vsock.uds_path).map_err(|e| {
+        anyhow::anyhow!(
+            "could not connect to emberd on '{}': {e}\n\
+             Hint: make sure the VM is running and emberd is started inside the guest.",
+            args.name
+        )
+    })?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+
+    let req = serde_json::json!({"op": "vm_stats"});
+    serde_json::to_writer(&mut stream, &req)?;
+    stream.write_all(b"\n")?;
+    stream.flush()?;
+
+    let mut reader = BufReader::new(&stream);
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+
+    let resp: serde_json::Value = serde_json::from_str(line.trim())
+        .map_err(|e| anyhow::anyhow!("invalid response from emberd: {e}"))?;
+
+    if let Some(err) = resp.get("error").and_then(|v| v.as_str()) {
+        anyhow::bail!("emberd error: {err}");
+    }
+
+    match args.format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&resp)?);
+        }
+        OutputFormat::Table => {
+            let cpu = resp["cpu_pct"].as_f64().unwrap_or(0.0);
+            let mem_used = resp["memory_used_mb"].as_u64().unwrap_or(0);
+            let mem_total = resp["memory_total_mb"].as_u64().unwrap_or(0);
+            let disk_gb = resp["disk_used_gb"].as_f64().unwrap_or(0.0);
+            let rx = resp["net_rx_bytes"].as_u64().unwrap_or(0);
+            let tx = resp["net_tx_bytes"].as_u64().unwrap_or(0);
+            println!("VM stats for '{}':", args.name);
+            println!("  CPU:    {cpu:.1}%");
+            println!("  Memory: {mem_used} / {mem_total} MB");
+            println!("  Disk:   {disk_gb:.2} GB used");
+            println!("  Net RX: {rx} bytes");
+            println!("  Net TX: {tx} bytes");
         }
     }
 
