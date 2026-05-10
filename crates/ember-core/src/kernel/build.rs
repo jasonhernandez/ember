@@ -96,9 +96,12 @@ pub fn build(store: &StateStore, jobs: usize, tool: &str) -> anyhow::Result<Path
     //   3. Merge base config + docker.fragment + avf.fragment
     //   4. Strip BUILD_SALT for reproducibility
     //   5. Compile vmlinux
-    let uid = nix::unistd::getuid();
-    let gid = nix::unistd::getgid();
-    let user_flag = format!("{}:{}", uid, gid);
+    #[cfg(not(target_os = "macos"))]
+    let user_flag = {
+        let uid = nix::unistd::getuid();
+        let gid = nix::unistd::getgid();
+        format!("{}:{}", uid, gid)
+    };
 
     let build_script = format!(
         "set -e\n\
@@ -117,21 +120,15 @@ pub fn build(store: &StateStore, jobs: usize, tool: &str) -> anyhow::Result<Path
     );
 
     println!("Starting kernel build (this may take 10-30 minutes)...");
+
+    let volume = format!("{}:/build", work.display());
+    #[cfg(not(target_os = "macos"))]
+    let run_args = docker_run_args(&volume, &user_flag, &build_script);
+    #[cfg(target_os = "macos")]
+    let run_args = docker_run_args(&volume, &build_script);
+
     let status = Command::new(tool)
-        .args([
-            "run",
-            "--rm",
-            "--user",
-            &user_flag,
-            "-v",
-            &format!("{}:/build", work.display()),
-            "-w",
-            "/build",
-            BUILDER_IMAGE,
-            "sh",
-            "-c",
-            &build_script,
-        ])
+        .args(&run_args)
         .status()
         .with_context(|| format!("failed to execute '{tool} run'"))?;
     if !status.success() {
@@ -165,4 +162,77 @@ pub fn build(store: &StateStore, jobs: usize, tool: &str) -> anyhow::Result<Path
 
     println!("Kernel installed to {}", dest.display());
     Ok(dest)
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/// Build the `docker run` argument list.
+///
+/// On Linux, `--user uid:gid` is included so build artifacts are owned by the
+/// calling user. On macOS the flag is omitted because Colima / Docker Desktop
+/// manage file ownership through their file-sharing layer and an explicit
+/// `--user` causes permission errors (SEC-475 #1).
+#[cfg(not(target_os = "macos"))]
+fn docker_run_args<'a>(volume: &'a str, user_flag: &'a str, build_script: &'a str) -> Vec<&'a str> {
+    vec![
+        "run",
+        "--rm",
+        "--user",
+        user_flag,
+        "-v",
+        volume,
+        "-w",
+        "/build",
+        BUILDER_IMAGE,
+        "sh",
+        "-c",
+        build_script,
+    ]
+}
+
+#[cfg(target_os = "macos")]
+fn docker_run_args<'a>(volume: &'a str, build_script: &'a str) -> Vec<&'a str> {
+    vec![
+        "run",
+        "--rm",
+        "-v",
+        volume,
+        "-w",
+        "/build",
+        BUILDER_IMAGE,
+        "sh",
+        "-c",
+        build_script,
+    ]
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn docker_run_args_linux_includes_user_flag() {
+        let args = docker_run_args("/work:/build", "1000:1000", "echo hi");
+        let pos = args.iter().position(|&a| a == "--user");
+        assert!(pos.is_some(), "--user must be present on Linux");
+        let next = args[pos.unwrap() + 1];
+        assert_eq!(next, "1000:1000");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn docker_run_args_macos_omits_user_flag() {
+        let args = docker_run_args("/work:/build", "echo hi");
+        assert!(
+            !args.contains(&"--user"),
+            "--user must NOT be present on macOS"
+        );
+    }
 }

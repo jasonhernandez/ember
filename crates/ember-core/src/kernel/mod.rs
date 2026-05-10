@@ -84,13 +84,24 @@ impl fmt::Display for KernelPreset {
 }
 
 impl FromStr for KernelPreset {
-    type Err = ();
+    type Err = String;
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s.to_ascii_lowercase().as_str() {
-            "stock" => Ok(KernelPreset::Stock),
+            "stock" => {
+                #[cfg(target_os = "macos")]
+                return Err(
+                    "--kernel stock is not supported on macOS.\n\
+                     The Firecracker CI kernel lacks virtio-pci/virtio-console drivers required by\n\
+                     Apple Virtualization. Build a macOS-compatible kernel with:\n\
+                         ember kernel build"
+                        .to_string(),
+                );
+                #[cfg(not(target_os = "macos"))]
+                Ok(KernelPreset::Stock)
+            }
             "docker" => Ok(KernelPreset::Docker),
-            _ => Err(()),
+            _ => Err(format!("unknown kernel preset '{s}'")),
         }
     }
 }
@@ -146,6 +157,12 @@ impl KernelSpec {
                         Ok(dest)
                     }
                     None => {
+                        #[cfg(target_os = "macos")]
+                        anyhow::bail!(
+                            "Default kernel has not been built yet.\n\
+                             Hint: run `ember kernel build` to compile a macOS-compatible kernel."
+                        );
+                        #[cfg(not(target_os = "macos"))]
                         anyhow::bail!(
                             "Default kernel has not been built yet.\n\
                              Hint: run `sudo ember kernel build` to compile a kernel \
@@ -161,11 +178,14 @@ impl KernelSpec {
 }
 
 impl FromStr for KernelSpec {
-    type Err = std::convert::Infallible;
+    type Err = String;
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        if let Ok(preset) = s.parse::<KernelPreset>() {
-            Ok(KernelSpec::Preset(preset))
+        // Known preset keywords must never silently fall back to a path so
+        // that platform-specific rejections (e.g. "stock" on macOS) surface.
+        let is_preset_keyword = matches!(s.to_ascii_lowercase().as_str(), "stock" | "docker");
+        if is_preset_keyword {
+            s.parse::<KernelPreset>().map(KernelSpec::Preset)
         } else {
             Ok(KernelSpec::Path(PathBuf::from(s)))
         }
@@ -187,7 +207,7 @@ impl<'de> de::Deserialize<'de> for KernelSpec {
         D: de::Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
-        Ok(s.parse().unwrap())
+        s.parse::<KernelSpec>().map_err(de::Error::custom)
     }
 }
 
@@ -195,6 +215,7 @@ impl<'de> de::Deserialize<'de> for KernelSpec {
 mod tests {
     use super::*;
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn parse_preset_stock() {
         assert_eq!("stock".parse::<KernelPreset>(), Ok(KernelPreset::Stock));
@@ -205,9 +226,18 @@ mod tests {
         assert_eq!("docker".parse::<KernelPreset>(), Ok(KernelPreset::Docker));
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn parse_preset_case_insensitive() {
         assert_eq!("STOCK".parse::<KernelPreset>(), Ok(KernelPreset::Stock));
+        assert_eq!("DOCKER".parse::<KernelPreset>(), Ok(KernelPreset::Docker));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_preset_case_insensitive() {
+        // STOCK is rejected on macOS; DOCKER is always valid.
+        assert!("STOCK".parse::<KernelPreset>().is_err());
         assert_eq!("DOCKER".parse::<KernelPreset>(), Ok(KernelPreset::Docker));
     }
 
@@ -218,12 +248,49 @@ mod tests {
         assert!("containerd".parse::<KernelPreset>().is_err());
     }
 
+    /// On macOS, --kernel stock is rejected at parse time with a clear message.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stock_preset_rejected_on_macos() {
+        let err = "stock".parse::<KernelPreset>().unwrap_err();
+        assert!(
+            err.contains("not supported on macOS"),
+            "unexpected error: {err}"
+        );
+        assert!(err.contains("ember kernel build"), "hint missing: {err}");
+    }
+
+    /// On macOS, parsing "stock" as a KernelSpec must fail (not silently become a path).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn spec_stock_rejected_on_macos() {
+        let result = "stock".parse::<KernelSpec>();
+        assert!(result.is_err(), "expected Err but got Ok");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("not supported on macOS"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn spec_from_preset_name() {
         assert_eq!(
             "stock".parse::<KernelSpec>().unwrap(),
             KernelSpec::Preset(KernelPreset::Stock)
         );
+        assert_eq!(
+            "docker".parse::<KernelSpec>().unwrap(),
+            KernelSpec::Preset(KernelPreset::Docker)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn spec_from_preset_name() {
+        // On macOS only "docker" is valid; "stock" is rejected.
+        assert!("stock".parse::<KernelSpec>().is_err());
         assert_eq!(
             "docker".parse::<KernelSpec>().unwrap(),
             KernelSpec::Preset(KernelPreset::Docker)
@@ -278,10 +345,21 @@ mod tests {
         assert_eq!(KernelPreset::Docker.to_string(), "docker");
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn serde_deserialize_preset() {
         let spec: KernelSpec = serde_json::from_str(r#""stock""#).unwrap();
         assert_eq!(spec, KernelSpec::Preset(KernelPreset::Stock));
+
+        let spec: KernelSpec = serde_json::from_str(r#""docker""#).unwrap();
+        assert_eq!(spec, KernelSpec::Preset(KernelPreset::Docker));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn serde_deserialize_preset() {
+        // On macOS, "stock" in YAML/JSON config must fail to deserialize.
+        assert!(serde_json::from_str::<KernelSpec>(r#""stock""#).is_err());
 
         let spec: KernelSpec = serde_json::from_str(r#""docker""#).unwrap();
         assert_eq!(spec, KernelSpec::Preset(KernelPreset::Docker));
