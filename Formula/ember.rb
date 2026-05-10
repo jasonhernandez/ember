@@ -25,8 +25,8 @@ class Ember < Formula
   on_macos do
     depends_on xcode: ["14.0", :build]
     depends_on macos: :ventura
-    depends_on "fakeroot" => :build
-    depends_on "gnu-tar" => :build
+    depends_on "fakeroot"
+    depends_on "gnu-tar"
   end
 
   def install
