@@ -44,6 +44,13 @@ pub struct BuildArgs {
     /// Path to Dockerfile (default: built-in Ubuntu VM image)
     #[arg(long = "file", short = 'f')]
     pub dockerfile: Option<PathBuf>,
+
+    /// Delete and rebuild the image if it already exists locally.
+    /// Without this flag, building an image that already exists is an error.
+    /// If VMs are using the image, the build fails even with --force;
+    /// stop or delete those VMs first.
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(Args)]
@@ -157,8 +164,35 @@ fn build(args: &BuildArgs, state_dir: &Path) -> anyhow::Result<()> {
     // Check if this image already exists.
     let registry = ImageRegistry::load(&store)?;
     if registry.exists(&local_name) {
-        println!("Image '{}' already exists locally.", local_name);
-        return Ok(());
+        if !args.force {
+            anyhow::bail!(
+                "image '{}' already exists locally.\n\
+                 Use --force to delete and rebuild, or `ember image delete {}` first.",
+                local_name,
+                args.name,
+            );
+        }
+
+        // --force: refuse if any VMs depend on this image (do not destroy VMs).
+        let entry = registry.get(&local_name).unwrap();
+        let dependent_vms: Vec<VmMetadata> = vm::list(&store)?
+            .into_iter()
+            .filter(|v| v.image == entry.reference)
+            .collect();
+        if !dependent_vms.is_empty() {
+            let vm_names: Vec<&str> = dependent_vms.iter().map(|v| v.name.as_str()).collect();
+            anyhow::bail!(
+                "image '{}' is in use by VM(s): {}.\n\
+                 Stop or delete those VMs first.",
+                local_name,
+                vm_names.join(", "),
+            );
+        }
+
+        // Delete existing image before rebuilding.
+        println!("Removing existing image '{}'...", local_name);
+        storage.destroy_image_storage(&local_name, false)?;
+        image::registry::remove_image(&store, &local_name)?;
     }
 
     println!("Building image '{}'...", args.name);
