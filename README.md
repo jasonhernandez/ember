@@ -14,7 +14,7 @@ brew tap aljoscha/ember https://github.com/aljoscha/ember
 brew install ember
 ```
 
-This installs both `ember` and `ember-vz` (the Swift helper for Apple Virtualization Framework), plus runtime dependencies (`e2fsprogs`, `skopeo`). Requires macOS 13+ (Ventura) and Xcode Command Line Tools.
+This installs both `ember` and `ember-vz` (the Swift helper for Apple Virtualization Framework), plus runtime dependencies (`e2fsprogs`, `skopeo`) and kernel-build dependencies (`fakeroot`, `gnu-tar`, installed transitively by the formula). Requires macOS 13+ (Ventura) and Xcode Command Line Tools.
 
 To install the latest development version instead of a tagged release:
 
