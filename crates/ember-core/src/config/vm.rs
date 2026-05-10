@@ -130,6 +130,7 @@ boot_args: "console=ttyS0 reboot=k panic=1 pci=off"
         );
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn parse_kernel_preset() {
         let yaml = "kernel: stock\n";
@@ -149,6 +150,21 @@ boot_args: "console=ttyS0 reboot=k panic=1 pci=off"
             Some(crate::kernel::KernelSpec::Path(std::path::PathBuf::from(
                 "containerd"
             )))
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_kernel_preset_stock_rejected_on_macos() {
+        let yaml = "kernel: stock\n";
+        let result: Result<VmConfig, _> = serde_yaml::from_str(yaml);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("not supported on macOS"),
+            "expected 'not supported on macOS' in error"
         );
     }
 
