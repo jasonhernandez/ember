@@ -4,13 +4,15 @@
 //! (testing) and serves JSON-lines requests. Matches the protocol expected
 //! by Thermite's `EmberdClient` (`daemon_client.py`).
 //!
-//! Operations: ping, exec, read_file, write_file, agent_status, agent_reap, vm_stats.
+//! Operations: ping, exec, read_file, write_file, agent_status, agent_reap,
+//! vm_stats, workspace_reset.
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use clap::Parser;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixListener;
+use std::path::Path;
 use std::sync::OnceLock;
 use std::time::Instant;
 
@@ -162,6 +164,7 @@ fn dispatch(req: &Value) -> Value {
         "agent_status" => op_agent_status(),
         "agent_reap" => op_agent_reap(),
         "vm_stats" => op_vm_stats(),
+        "workspace_reset" => op_workspace_reset(req),
         _ => json!({"error": format!("unknown op: {op}")}),
     }
 }
@@ -280,6 +283,56 @@ fn op_vm_stats() -> Value {
         "disk_used_gb": disk_used_gb,
         "net_rx_bytes": net_rx_bytes,
         "net_tx_bytes": net_tx_bytes,
+    })
+}
+
+/// Atomically reset a workspace directory. In order:
+///   1. Kill every process whose CWD is under `path` (walk `/proc/*/cwd`).
+///   2. Unmount any bind/overlay mounts at or under `path` (deepest first).
+///   3. `rm -rf path`.
+///   4. Verify `path` is gone; error if it still exists.
+///
+/// Because this performs an unconditional recursive delete, `path` is validated
+/// hard and fails closed: it must be an absolute path with no `..` components,
+/// strictly under `/home/ubuntu/` or `/tmp/`. Replaces the SSH
+/// `pkill + rm -rf + verify` dance in `agents/scripts/reset_workspace.sh`.
+fn op_workspace_reset(req: &Value) -> Value {
+    let Some(path) = req.get("path").and_then(Value::as_str) else {
+        return json!({"error": "missing 'path' field"});
+    };
+    let start = Instant::now();
+
+    if let Err(e) = validate_reset_path(path) {
+        return json!({"error": format!("workspace_reset: {e}")});
+    }
+
+    // 1. Kill processes whose CWD is under `path` so nothing races the delete.
+    let pids = find_pids_with_cwd_under(path);
+    reap_pids(&pids);
+
+    // 2. Unmount bind/overlay mounts inside `path` before removing the tree.
+    if let Err(e) = unmount_under(path) {
+        return json!({"error": format!("workspace_reset: {e}")});
+    }
+
+    // 3. Count entries (for observability), then remove the tree.
+    let removed_count = count_entries(Path::new(path));
+    if let Err(e) = std::fs::remove_dir_all(path) {
+        // Already-absent is fine; anything else is a hard failure.
+        if e.kind() != std::io::ErrorKind::NotFound {
+            return json!({"error": format!("workspace_reset: rm -rf {path}: {e}")});
+        }
+    }
+
+    // 4. Verify the path is actually gone.
+    if Path::new(path).exists() {
+        return json!({"error": format!("workspace_reset: path still exists after delete: {path}")});
+    }
+
+    json!({
+        "ok": true,
+        "removed_count": removed_count,
+        "duration_ms": start.elapsed().as_millis() as u64,
     })
 }
 
@@ -542,6 +595,174 @@ fn reap_pids(pids: &[u32]) -> Vec<u32> {
 }
 
 // ---------------------------------------------------------------------------
+// workspace_reset helpers
+// ---------------------------------------------------------------------------
+
+/// Allowed roots for `workspace_reset`. The path must be strictly *under* one
+/// of these (a bare root is rejected).
+const RESET_ALLOWED_ROOTS: [&str; 2] = ["/home/ubuntu/", "/tmp/"];
+
+/// Validate a `workspace_reset` target. Fails closed: the path must be
+/// absolute, contain no `..` component, and sit strictly under an allowed root.
+fn validate_reset_path(path: &str) -> Result<(), String> {
+    let p = Path::new(path);
+    if !p.is_absolute() {
+        return Err(format!("path must be absolute: {path}"));
+    }
+    if p.components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(format!("path must not contain '..': {path}"));
+    }
+    let under_allowed = RESET_ALLOWED_ROOTS
+        .iter()
+        .any(|root| path.starts_with(root) && path.len() > root.len());
+    if !under_allowed {
+        return Err(format!(
+            "path outside allowed roots (/home/ubuntu/, /tmp/): {path}"
+        ));
+    }
+    Ok(())
+}
+
+/// `path` with a single trailing slash, for prefix matching of descendants.
+#[cfg(target_os = "linux")]
+fn path_with_trailing_slash(path: &str) -> String {
+    if path.ends_with('/') {
+        path.to_string()
+    } else {
+        format!("{path}/")
+    }
+}
+
+/// Recursively count filesystem entries at `path`, including `path` itself.
+/// Does not follow symlinks (a symlink counts as one entry, not its target).
+/// Returns 0 if `path` does not exist.
+fn count_entries(path: &Path) -> u64 {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return 0;
+    };
+    let mut count = 1;
+    if meta.file_type().is_dir() {
+        if let Ok(rd) = std::fs::read_dir(path) {
+            for entry in rd.flatten() {
+                count += count_entries(&entry.path());
+            }
+        }
+    }
+    count
+}
+
+/// Scan `/proc/*/cwd` for processes whose current working directory is `path`
+/// or a descendant of it. Excludes our own pid. Empty when `/proc` is absent.
+#[cfg(target_os = "linux")]
+fn find_pids_with_cwd_under(path: &str) -> Vec<u32> {
+    let mut pids = Vec::new();
+    let Ok(proc_dir) = std::fs::read_dir("/proc") else {
+        return pids;
+    };
+    let self_pid = std::process::id();
+    let prefix = path_with_trailing_slash(path);
+    for entry in proc_dir.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        let Ok(pid) = name_str.parse::<u32>() else {
+            continue;
+        };
+        if pid == self_pid {
+            continue;
+        }
+        let Ok(target) = std::fs::read_link(format!("/proc/{pid}/cwd")) else {
+            continue;
+        };
+        let target = target.to_string_lossy();
+        if target == path || target.starts_with(&prefix) {
+            pids.push(pid);
+        }
+    }
+    pids
+}
+
+#[cfg(not(target_os = "linux"))]
+fn find_pids_with_cwd_under(path: &str) -> Vec<u32> {
+    let _ = path;
+    Vec::new()
+}
+
+/// Decode the octal escapes (`\040` space, `\011` tab, `\012` newline,
+/// `\134` backslash) that `/proc/mounts` uses in mount-point fields.
+#[cfg(target_os = "linux")]
+fn decode_mount_field(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 3 < bytes.len() {
+            let octal = &raw[i + 1..i + 4];
+            if let Ok(code) = u8::from_str_radix(octal, 8) {
+                out.push(code as char);
+                i += 4;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+/// Unmount every mount at or under `path`, deepest first so nested mounts
+/// unwind cleanly. Uses a lazy unmount (`umount -l`) so a busy mount detaches
+/// rather than blocking the reset. No-op when `/proc/mounts` is unreadable.
+#[cfg(target_os = "linux")]
+fn unmount_under(path: &str) -> Result<(), String> {
+    let Ok(content) = std::fs::read_to_string("/proc/mounts") else {
+        return Ok(());
+    };
+    let prefix = path_with_trailing_slash(path);
+    let mut mountpoints: Vec<String> = Vec::new();
+    for line in content.lines() {
+        // Fields: device mountpoint fstype options dump pass
+        let mut fields = line.split_whitespace();
+        let _device = fields.next();
+        let Some(mp_raw) = fields.next() else {
+            continue;
+        };
+        let mp = decode_mount_field(mp_raw);
+        if mp == path || mp.starts_with(&prefix) {
+            mountpoints.push(mp);
+        }
+    }
+    // Deepest paths first.
+    mountpoints.sort_by_key(|mp| std::cmp::Reverse(mp.len()));
+    for mp in mountpoints {
+        match std::process::Command::new("umount")
+            .arg("-l")
+            .arg(&mp)
+            .output()
+        {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => {
+                return Err(format!(
+                    "umount {mp}: {}",
+                    String::from_utf8_lossy(&o.stderr).trim()
+                ))
+            }
+            Err(e) => return Err(format!("umount {mp}: {e}")),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn unmount_under(path: &str) -> Result<(), String> {
+    let _ = path;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -720,6 +941,124 @@ mod tests {
 
         let _ = child.wait();
         assert!(!process_alive(pid));
+    }
+
+    // -- workspace_reset tests --
+
+    #[test]
+    fn validate_reset_path_accepts_under_roots() {
+        assert!(validate_reset_path("/home/ubuntu/workspace").is_ok());
+        assert!(validate_reset_path("/home/ubuntu/a/b/c").is_ok());
+        assert!(validate_reset_path("/tmp/foo").is_ok());
+        assert!(validate_reset_path("/tmp/foo/bar").is_ok());
+    }
+
+    #[test]
+    fn validate_reset_path_rejects_unsafe() {
+        // Outside allowed roots.
+        assert!(validate_reset_path("/etc/passwd").is_err());
+        assert!(validate_reset_path("/var/lib").is_err());
+        // Bare roots are rejected (must be strictly under).
+        assert!(validate_reset_path("/home/ubuntu").is_err());
+        assert!(validate_reset_path("/tmp").is_err());
+        assert!(validate_reset_path("/").is_err());
+        // Prefix look-alikes that are not real descendants.
+        assert!(validate_reset_path("/home/ubuntuevil").is_err());
+        assert!(validate_reset_path("/tmpfoo").is_err());
+        // Traversal and relative paths.
+        assert!(validate_reset_path("/home/ubuntu/../etc").is_err());
+        assert!(validate_reset_path("relative/path").is_err());
+    }
+
+    #[test]
+    fn count_entries_counts_recursively() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        std::fs::create_dir_all(base.join("a/b")).unwrap();
+        std::fs::write(base.join("a/f1"), b"x").unwrap();
+        std::fs::write(base.join("a/b/f2"), b"y").unwrap();
+        // base + a + a/b + a/f1 + a/b/f2 = 5
+        assert_eq!(count_entries(base), 5);
+    }
+
+    #[test]
+    fn count_entries_missing_is_zero() {
+        assert_eq!(count_entries(Path::new("/tmp/emberd-nonexistent-xyz")), 0);
+    }
+
+    #[test]
+    fn workspace_reset_missing_path() {
+        let resp = dispatch(&json!({"op": "workspace_reset"}));
+        assert!(resp["error"].as_str().unwrap().contains("path"));
+    }
+
+    #[test]
+    fn workspace_reset_rejects_unsafe_path() {
+        let resp = dispatch(&json!({"op": "workspace_reset", "path": "/etc"}));
+        assert!(resp["error"].as_str().unwrap().contains("workspace_reset"));
+    }
+
+    #[test]
+    fn workspace_reset_removes_tree_and_counts() {
+        let base = std::env::temp_dir().join(format!("emberd-reset-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("a/b")).unwrap();
+        std::fs::write(base.join("a/f1"), b"x").unwrap();
+        std::fs::write(base.join("a/b/f2"), b"y").unwrap();
+
+        let resp = dispatch(&json!({"op": "workspace_reset", "path": base.to_str().unwrap()}));
+        assert_eq!(resp["ok"], true, "resp: {resp}");
+        // base + a + a/b + a/f1 + a/b/f2 = 5
+        assert_eq!(resp["removed_count"].as_u64().unwrap(), 5);
+        assert!(resp["duration_ms"].as_u64().is_some());
+        assert!(!base.exists(), "path should be gone after reset");
+    }
+
+    #[test]
+    fn workspace_reset_absent_path_is_ok() {
+        // A path that does not exist resets to "already clean" with count 0.
+        let base = std::env::temp_dir().join(format!("emberd-reset-absent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let resp = dispatch(&json!({"op": "workspace_reset", "path": base.to_str().unwrap()}));
+        assert_eq!(resp["ok"], true, "resp: {resp}");
+        assert_eq!(resp["removed_count"].as_u64().unwrap(), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn workspace_reset_kills_process_with_cwd_inside() {
+        use std::process::Command;
+
+        let base = std::env::temp_dir().join(format!("emberd-reset-cwd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        let mut child = Command::new("sleep")
+            .arg("300")
+            .current_dir(&base)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        assert!(process_alive(pid));
+        assert!(find_pids_with_cwd_under(base.to_str().unwrap()).contains(&pid));
+
+        let resp = dispatch(&json!({"op": "workspace_reset", "path": base.to_str().unwrap()}));
+        assert_eq!(resp["ok"], true, "resp: {resp}");
+
+        let _ = child.wait();
+        assert!(
+            !process_alive(pid),
+            "process with cwd inside should be killed"
+        );
+        assert!(!base.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn decode_mount_field_decodes_octal_escapes() {
+        assert_eq!(decode_mount_field("/mnt/foo"), "/mnt/foo");
+        assert_eq!(decode_mount_field("/mnt/a\\040b"), "/mnt/a b");
+        assert_eq!(decode_mount_field("/mnt/a\\011b"), "/mnt/a\tb");
     }
 
     #[test]

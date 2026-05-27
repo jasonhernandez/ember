@@ -75,6 +75,33 @@ the PIDs that were targeted for observability.
 No-op safe: when no claude processes are running, replies
 `{"killed_pids":[],"process_count":0}` with success.
 
+### workspace_reset
+
+```
+-> {"op":"workspace_reset","path":"/home/ubuntu/workspace"}
+<- {"ok":true,"removed_count":1234,"duration_ms":87}
+```
+
+Atomically resets a workspace directory. In order:
+
+1. Kills every process whose CWD is under `path` (walks `/proc/*/cwd`).
+2. Unmounts any bind/overlay mounts at or under `path`, deepest first
+   (lazy `umount -l`).
+3. `rm -rf path`.
+4. Verifies `path` is gone; returns an error if it still exists.
+
+`removed_count` is the number of filesystem entries removed (the directory
+itself plus all descendants); `duration_ms` is the wall-clock time of the reset.
+
+Because this performs an unconditional recursive delete, `path` is validated
+hard and **fails closed**: it must be an absolute path with no `..` component,
+strictly under `/home/ubuntu/` or `/tmp/`. Anything else is rejected with an
+`error` and no filesystem changes. A `path` that does not exist resets to
+"already clean" (`removed_count: 0`).
+
+Replaces the SSH `pkill + rm -rf workspace + verify` dance previously done from
+the host.
+
 ## Build
 
 ```bash
@@ -106,8 +133,9 @@ emberd --uds /tmp/emberd.sock
 cargo test -p emberd
 ```
 
-26 tests covering all operations, error handling, the agent_reap
-SIGTERM/SIGKILL escalation path, and a full UDS integration roundtrip.
+Tests cover all operations, error handling, the agent_reap SIGTERM/SIGKILL
+escalation path, the workspace_reset path-validation and delete logic, and full
+UDS integration roundtrips (including a dedicated `tests/test_workspace_reset.rs`).
 
 ## Image integration
 
