@@ -54,11 +54,23 @@ Content is base64-encoded.
 
 ```
 -> {"op":"agent_status"}
-<- {"running":true,"pid":9999,"task_id":"SEC-200"}
+<- {"alive":true,"pid":9999,"rss_kb":1234567,"stream_offset":28847,"result_mtime":1716006000}
 ```
 
-Scans `/proc` for a process matching `thermite-entrypoint` and reads
-`/tmp/thermite-task-id` for the task ID.
+Scans `/proc` for a process matching `thermite-entrypoint` and reports its
+liveness plus the telemetry a poller needs to skip no-op polls and detect
+"done + result written" early:
+
+- `alive` — whether an agent process is running.
+- `pid` — the agent pid, or `null` when not alive.
+- `rss_kb` — agent resident set size in kB (`VmRSS` from `/proc/<pid>/status`),
+  `0` when not alive.
+- `stream_offset` — byte size of `/tmp/agent-output.jsonl`, `0` if absent.
+- `result_mtime` — mtime of `/tmp/thermite-result.json` in whole seconds since
+  the Unix epoch, `0` if the file is absent.
+
+All fields are always present; missing files and absent agents fall back to the
+defaults above.
 
 ### agent_reap
 
@@ -102,6 +114,22 @@ strictly under `/home/ubuntu/` or `/tmp/`. Anything else is rejected with an
 Replaces the SSH `pkill + rm -rf workspace + verify` dance previously done from
 the host.
 
+### fs_clean
+
+```
+-> {"op":"fs_clean","globs":["/tmp/thermite-*","/tmp/agent-*"]}
+<- {"removed":["/tmp/thermite-result.json","/tmp/agent-output.jsonl"]}
+```
+
+Deletes files matching the given shell globs and returns the list of paths
+actually removed. Only regular files are removed — directories are skipped.
+
+Path-validated and **fails closed**: every expanded path must be absolute, have
+no `..` component, and sit strictly under `/tmp` (component-based matching, so
+look-alikes like `/tmpfoo` are rejected). Anything outside `/tmp` is silently
+skipped rather than removed. Invalid glob patterns are skipped without failing
+the whole request. An empty `globs` list is a no-op (`{"removed":[]}`).
+
 ## Build
 
 ```bash
@@ -134,8 +162,10 @@ cargo test -p emberd
 ```
 
 Tests cover all operations, error handling, the agent_reap SIGTERM/SIGKILL
-escalation path, the workspace_reset path-validation and delete logic, and full
-UDS integration roundtrips (including a dedicated `tests/test_workspace_reset.rs`).
+escalation path, the workspace_reset and fs_clean path-validation and delete
+logic, the enhanced agent_status fields, and full UDS integration roundtrips
+(dedicated `tests/test_workspace_reset.rs`, `tests/test_fs_clean.rs`, and
+`tests/test_agent_status.rs`).
 
 ## Image integration
 
