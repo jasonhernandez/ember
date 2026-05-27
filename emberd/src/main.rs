@@ -5,7 +5,9 @@
 //! by Thermite's `EmberdClient` (`daemon_client.py`).
 //!
 //! Operations: ping, exec, read_file, write_file, agent_status, agent_reap,
-//! vm_stats, workspace_reset, fs_clean.
+//! vm_stats, workspace_reset, fs_clean, task_checkpoint, task_restore.
+
+mod checkpoint;
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use clap::Parser;
@@ -166,6 +168,8 @@ fn dispatch(req: &Value) -> Value {
         "vm_stats" => op_vm_stats(),
         "workspace_reset" => op_workspace_reset(req),
         "fs_clean" => op_fs_clean(req),
+        "task_checkpoint" => checkpoint::op_task_checkpoint(req),
+        "task_restore" => checkpoint::op_task_restore(req),
         _ => json!({"error": format!("unknown op: {op}")}),
     }
 }
