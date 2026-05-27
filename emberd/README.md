@@ -60,6 +60,21 @@ Content is base64-encoded.
 Scans `/proc` for a process matching `thermite-entrypoint` and reads
 `/tmp/thermite-task-id` for the task ID.
 
+### agent_reap
+
+```
+-> {"op":"agent_reap"}
+<- {"killed_pids":[123,456],"process_count":2}
+```
+
+Kills all `claude` agent subprocesses (matched by the `claude --model` argv
+pattern: argv[0] basename `claude` plus a `--model` flag). Sends `SIGTERM`,
+waits up to 5 seconds, then escalates to `SIGKILL` for any stragglers. Returns
+the PIDs that were targeted for observability.
+
+No-op safe: when no claude processes are running, replies
+`{"killed_pids":[],"process_count":0}` with success.
+
 ## Build
 
 ```bash
@@ -91,8 +106,8 @@ emberd --uds /tmp/emberd.sock
 cargo test -p emberd
 ```
 
-15 tests covering all operations, error handling, and a full UDS
-integration roundtrip.
+26 tests covering all operations, error handling, the agent_reap
+SIGTERM/SIGKILL escalation path, and a full UDS integration roundtrip.
 
 ## Image integration
 
