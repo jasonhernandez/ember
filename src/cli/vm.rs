@@ -859,6 +859,11 @@ fn fork(args: &ForkArgs, state_dir: &Path) -> anyhow::Result<()> {
 ///
 /// Uses a [`Rollback`] guard to ensure all resources (IP allocation, TAP device,
 /// iptables rules, Firecracker process) are cleaned up if any step fails.
+/// Maximum number of slots to try when a VM fails to boot with a transient
+/// VZ crash (SEC-419). Each attempt routes around the previous poisoned slot;
+/// 3 covers the observed case (one poisoned slot) with headroom to spare.
+const MAX_VZ_START_ATTEMPTS: u32 = 3;
+
 fn start(args: &StartArgs, state_dir: &Path) -> anyhow::Result<()> {
     use ember_core::cleanup::Rollback;
 
@@ -881,15 +886,65 @@ fn start(args: &StartArgs, state_dir: &Path) -> anyhow::Result<()> {
 
     let mut rollback = Rollback::new();
 
-    // ── Networking ────────────────────────────────────────────────
+    // ── Networking + hypervisor (slot-poisoning retry, SEC-419) ───
+    //
+    // A transient ember-vz/VZ crash can leave the macOS vmnet framework
+    // holding stale state for the VM's /30 slot, so every VM later assigned to
+    // that slot crashes the same way at boot. On such a failure we tear down
+    // networking (releasing the slot), mark the slot poisoned, and retry on the
+    // next free slot. Hard failures (missing binary, bad config) are not
+    // retried — see Error::is_transient_vz_start.
 
     let net_backend = Network::new(store.clone());
-    eprintln!("Setting up network...");
-    let net_info = net_backend.setup(&metadata, &config)?;
-    eprintln!(
-        "  Guest IP: {}, Host IP: {}",
-        net_info.guest_ip, net_info.host_ip
-    );
+    let mut poisoned: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut attempt: u32 = 0;
+
+    let (net_info, started) = loop {
+        attempt += 1;
+
+        eprintln!("Setting up network...");
+        let net_info = net_backend.setup_excluding(&metadata, &config, &poisoned)?;
+        eprintln!(
+            "  Guest IP: {}, Host IP: {}",
+            net_info.guest_ip, net_info.host_ip
+        );
+
+        // Boot on the freshly-allocated slot. Vm::start kills its own orphaned
+        // helper on failure, so there is no VM process to clean up here.
+        let mut attempt_meta = metadata.clone();
+        attempt_meta.network = Some(net_info.clone());
+
+        eprintln!("Starting VM...");
+        match Vm::start(&attempt_meta, &config) {
+            Ok(started) => break (net_info, started),
+            Err(e) if e.is_transient_vz_start() && attempt < MAX_VZ_START_ATTEMPTS => {
+                // Learn the failed slot *before* releasing it, so the next
+                // allocate() routes around it instead of re-handing the same one.
+                let block = ember_core::network::ip::allocated_block(&store, &metadata.name)
+                    .ok()
+                    .flatten();
+                if let Some(b) = block {
+                    poisoned.insert(b);
+                }
+                let _ = net_backend.teardown(&attempt_meta);
+                eprintln!(
+                    "  VM start failed on slot {} (transient VZ crash); \
+                     retrying on next slot (attempt {}/{})...",
+                    block.map_or_else(|| "?".to_string(), |b| b.to_string()),
+                    attempt + 1,
+                    MAX_VZ_START_ATTEMPTS,
+                );
+            }
+            Err(e) => {
+                // Non-retriable, or out of attempts: release this slot and bail.
+                let _ = net_backend.teardown(&attempt_meta);
+                return Err(e.into());
+            }
+        }
+    };
+
+    // The surviving network allocation must be rolled back if a later start
+    // step fails.
     {
         let net = Network::new(StateStore::new(state_dir.to_path_buf()));
         let meta_name = metadata.name.clone();
@@ -905,11 +960,6 @@ fn start(args: &StartArgs, state_dir: &Path) -> anyhow::Result<()> {
     }
 
     metadata.network = Some(net_info);
-
-    // ── Hypervisor ────────────────────────────────────────────────
-
-    eprintln!("Starting VM...");
-    let started = Vm::start(&metadata, &config)?;
     let pid = started.pid;
     {
         let meta = metadata.clone();

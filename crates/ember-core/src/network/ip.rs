@@ -114,6 +114,27 @@ fn block_ips(base: Ipv4Addr, block_index: u32) -> IpAllocation {
 /// structurally impossible: even if the `find` logic regressed, a duplicate
 /// `INSERT` would fail with `SQLITE_CONSTRAINT_PRIMARYKEY`.
 pub fn allocate(store: &StateStore, subnet: &str, vm_name: &str) -> Result<IpAllocation> {
+    allocate_excluding(store, subnet, vm_name, &HashSet::new())
+}
+
+/// Allocate the lowest free /30 block, skipping any `exclude`d block indexes.
+///
+/// `exclude` lets the VM-start retry path (SEC-419) route around a "poisoned"
+/// slot: when a VM fails to boot with a transient vmnet/VZ crash, the macOS
+/// vmnet framework can keep stale state for that slot so every VM assigned to
+/// it crashes the same way. The retry releases the slot, adds its block index
+/// to `exclude`, and re-allocates — getting the *next* free block instead of
+/// the same poisoned one.
+///
+/// `exclude` is in-memory and supplied per call: poisoning is scoped to the
+/// retry loop within a single `vm start`/`fork` invocation and is not
+/// persisted. [`allocate`] is the empty-`exclude` special case.
+pub fn allocate_excluding(
+    store: &StateStore,
+    subnet: &str,
+    vm_name: &str,
+    exclude: &HashSet<u32>,
+) -> Result<IpAllocation> {
     let (base, prefix) = parse_cidr(subnet)?;
     let max = max_blocks(prefix);
 
@@ -139,11 +160,24 @@ pub fn allocate(store: &StateStore, subnet: &str, vm_name: &str) -> Result<IpAll
         .query_map(params![subnet], |r| r.get::<_, u32>(0))?
         .collect::<std::result::Result<_, _>>()?;
 
-    let block_index = (0..max).find(|i| !used.contains(i)).ok_or_else(|| {
-        Error::Network(format!(
-            "no free /30 blocks in {subnet} (all {max} blocks allocated)"
-        ))
-    })?;
+    let block_index = (0..max)
+        .find(|i| !used.contains(i) && !exclude.contains(i))
+        .ok_or_else(|| {
+            // Distinguish "subnet full" from "all free blocks poisoned" so the
+            // operator can tell a capacity problem from a vmnet-state problem.
+            if exclude.is_empty() {
+                Error::Network(format!(
+                    "no free /30 blocks in {subnet} (all {max} blocks allocated)"
+                ))
+            } else {
+                Error::Network(format!(
+                    "no usable /30 blocks in {subnet}: {} allocated, {} poisoned \
+                     (transient VZ start failures) — try 'ember network reset' or reboot",
+                    used.len(),
+                    exclude.len()
+                ))
+            }
+        })?;
 
     tx.execute(
         "INSERT INTO network_allocations (block_index, subnet, vm_name) VALUES (?1, ?2, ?3)",
@@ -152,6 +186,70 @@ pub fn allocate(store: &StateStore, subnet: &str, vm_name: &str) -> Result<IpAll
     tx.commit()?;
 
     Ok(block_ips(base, block_index))
+}
+
+/// Look up the /30 block index currently allocated to `vm_name`, if any.
+///
+/// Used by the start-retry path (SEC-419) to learn which slot just failed —
+/// it must be added to the poison set *before* the allocation is released,
+/// otherwise the next [`allocate_excluding`] would hand back the same slot.
+pub fn allocated_block(store: &StateStore, vm_name: &str) -> Result<Option<u32>> {
+    let conn = db::open(store.root())?;
+    let block: Option<u32> = conn
+        .query_row(
+            "SELECT block_index FROM network_allocations WHERE vm_name = ?1",
+            params![vm_name],
+            |r| r.get::<_, u32>(0),
+        )
+        .ok();
+    Ok(block)
+}
+
+/// One row of the network allocation table, with IPs resolved.
+///
+/// Returned by [`list_allocations`] for `ember network status`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AllocationRow {
+    pub block_index: u32,
+    pub subnet: String,
+    pub vm_name: String,
+    pub host_ip: String,
+    pub guest_ip: String,
+}
+
+/// List every recorded /30 allocation, ordered by subnet then block index.
+///
+/// Powers `ember network status` (SEC-419): operators can see which slots
+/// are in use and by which VM without reading the state DB directly.
+pub fn list_allocations(store: &StateStore) -> Result<Vec<AllocationRow>> {
+    let conn = db::open(store.root())?;
+    let mut stmt = conn.prepare(
+        "SELECT block_index, subnet, vm_name FROM network_allocations \
+         ORDER BY subnet, block_index",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, u32>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for (block_index, subnet, vm_name) in rows {
+        let (base, _prefix) = parse_cidr(&subnet)?;
+        let ips = block_ips(base, block_index);
+        out.push(AllocationRow {
+            block_index,
+            subnet,
+            vm_name,
+            host_ip: ips.host_ip,
+            guest_ip: ips.guest_ip,
+        });
+    }
+    Ok(out)
 }
 
 /// Release a VM's IP allocation.
@@ -418,6 +516,115 @@ mod tests {
         allocate(&store, "192.168.1.0/30", "vm1").unwrap();
         let err = allocate(&store, "192.168.1.0/30", "vm2").unwrap_err();
         assert!(err.to_string().contains("no free /30 blocks"));
+    }
+
+    // --- SEC-419: poison-aware allocation + slot lookup ---
+
+    #[test]
+    fn allocate_excluding_skips_poisoned_slot() {
+        let (_dir, store) = test_store();
+        // Slot 0 is free, but poisoned (its previous VM crashed at boot).
+        let poisoned = HashSet::from([0u32]);
+        let alloc = allocate_excluding(&store, "10.100.0.0/16", "vm1", &poisoned).unwrap();
+        // Allocator routes around slot 0 to the next free block.
+        assert_eq!(alloc.block_index, 1);
+        assert_eq!(alloc.host_ip, "10.100.0.5");
+    }
+
+    #[test]
+    fn allocate_excluding_skips_multiple_poisoned_slots() {
+        let (_dir, store) = test_store();
+        let poisoned = HashSet::from([0u32, 1, 2]);
+        let alloc = allocate_excluding(&store, "10.100.0.0/16", "vm1", &poisoned).unwrap();
+        assert_eq!(alloc.block_index, 3);
+    }
+
+    #[test]
+    fn allocate_excluding_empty_matches_allocate() {
+        let (_dir, store) = test_store();
+        let alloc = allocate_excluding(&store, "10.100.0.0/16", "vm1", &HashSet::new()).unwrap();
+        assert_eq!(alloc.block_index, 0);
+    }
+
+    #[test]
+    fn allocate_excluding_all_poisoned_errors_distinctly() {
+        let (_dir, store) = test_store();
+        // /30 subnet has exactly one block (index 0); poison it.
+        let poisoned = HashSet::from([0u32]);
+        let err = allocate_excluding(&store, "192.168.1.0/30", "vm1", &poisoned).unwrap_err();
+        let msg = err.to_string();
+        // Distinct from the "subnet full" message — points at poisoning.
+        assert!(msg.contains("poisoned"), "got: {msg}");
+        assert!(!msg.contains("all 1 blocks allocated"), "got: {msg}");
+    }
+
+    #[test]
+    fn allocated_block_reports_then_clears_on_release() {
+        let (_dir, store) = test_store();
+        allocate(&store, "10.100.0.0/16", "vm1").unwrap();
+        let a2 = allocate(&store, "10.100.0.0/16", "vm2").unwrap();
+
+        // The retry path reads the failed VM's slot before releasing it.
+        assert_eq!(
+            allocated_block(&store, "vm2").unwrap(),
+            Some(a2.block_index)
+        );
+        assert_eq!(allocated_block(&store, "nonexistent").unwrap(), None);
+
+        release(&store, "vm2").unwrap();
+        assert_eq!(allocated_block(&store, "vm2").unwrap(), None);
+    }
+
+    #[test]
+    fn list_allocations_reports_rows_with_resolved_ips() {
+        let (_dir, store) = test_store();
+        allocate(&store, "10.100.0.0/16", "vm1").unwrap();
+        allocate(&store, "10.100.0.0/16", "vm2").unwrap();
+        release(&store, "vm1").unwrap();
+
+        let rows = list_allocations(&store).unwrap();
+        // Only vm2 remains; IPs are resolved from its block index.
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].vm_name, "vm2");
+        assert_eq!(rows[0].block_index, 1);
+        assert_eq!(rows[0].guest_ip, "10.100.0.6");
+        assert_eq!(rows[0].host_ip, "10.100.0.5");
+    }
+
+    #[test]
+    fn list_allocations_empty_when_none() {
+        let (_dir, store) = test_store();
+        assert!(list_allocations(&store).unwrap().is_empty());
+    }
+
+    #[test]
+    fn poisoned_slot_release_and_retry_does_not_disturb_healthy_vms() {
+        // SEC-345 rollback-isolation shield: a failed VM's release + retry on
+        // the next slot must leave unrelated healthy allocations untouched.
+        let (_dir, store) = test_store();
+        let healthy1 = allocate(&store, "10.100.0.0/16", "healthy1").unwrap();
+        let healthy2 = allocate(&store, "10.100.0.0/16", "healthy2").unwrap();
+
+        // "failing" VM lands on slot 2, "crashes", is released + poisoned.
+        let failed = allocate(&store, "10.100.0.0/16", "failing").unwrap();
+        assert_eq!(failed.block_index, 2);
+        release(&store, "failing").unwrap();
+        let poisoned = HashSet::from([failed.block_index]);
+        let retry = allocate_excluding(&store, "10.100.0.0/16", "failing", &poisoned).unwrap();
+        assert_eq!(
+            retry.block_index, 3,
+            "retry must route around poisoned slot 2"
+        );
+
+        // Healthy VMs keep their original slots throughout.
+        assert_eq!(
+            allocated_block(&store, "healthy1").unwrap(),
+            Some(healthy1.block_index)
+        );
+        assert_eq!(
+            allocated_block(&store, "healthy2").unwrap(),
+            Some(healthy2.block_index)
+        );
     }
 
     #[test]

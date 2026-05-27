@@ -6,6 +6,7 @@ pub mod image;
 pub mod info;
 pub mod init;
 pub mod kernel;
+pub mod network;
 pub mod snapshot;
 pub mod ssh;
 pub mod vm;
@@ -60,6 +61,10 @@ pub enum Command {
     /// Manage VM snapshots
     #[command(subcommand)]
     Snapshot(snapshot::SnapshotCommand),
+
+    /// Inspect and clean up network slot allocations
+    #[command(subcommand)]
+    Network(network::NetworkCommand),
 
     /// SSH into a VM
     Ssh(ssh::SshArgs),
