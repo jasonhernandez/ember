@@ -119,25 +119,6 @@ pub enum Error {
     },
 }
 
-impl Error {
-    /// True if this is a VM-start failure likely to succeed when retried on a
-    /// *different* network slot (SEC-419).
-    ///
-    /// A transient ember-vz/VZ crash or readiness timeout surfaces as
-    /// `EmberVzStartFailed` wrapping an `Error::Vm` (see
-    /// `read_mac_from_ready_fd` in the macOS backend): the macOS vmnet layer
-    /// can poison a slot so every VM assigned to it crashes the same way, and
-    /// the next slot usually boots. A hard failure such as a missing
-    /// `ember-vz` binary is returned as `CommandExec` *before* wrapping, so it
-    /// never matches here — retrying that would just fail again.
-    pub fn is_transient_vz_start(&self) -> bool {
-        matches!(
-            self,
-            Error::EmberVzStartFailed { source, .. } if matches!(source.as_ref(), Error::Vm(_))
-        )
-    }
-}
-
 /// Render the multi-line diagnostic message for `Error::EmberVzStartFailed`.
 ///
 /// Format mirrors what `crates/ember-macos/src/vm.rs` was previously building
@@ -162,6 +143,42 @@ fn format_ember_vz_start_failed(
 
 /// Convenience alias used throughout ember.
 pub type Result<T> = std::result::Result<T, Error>;
+
+impl Error {
+    /// Create a `Command` error from a finished `std::process::Output`.
+    ///
+    /// Returns `Ok(output)` if the command succeeded.
+    pub fn check_command(
+        command: &str,
+        output: std::process::Output,
+    ) -> Result<std::process::Output> {
+        if output.status.success() {
+            return Ok(output);
+        }
+        Err(Error::Command {
+            command: command.to_string(),
+            exit_code: output.status.code().unwrap_or(-1),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        })
+    }
+
+    /// True if this is a VM-start failure likely to succeed when retried on a
+    /// *different* network slot (SEC-419).
+    ///
+    /// A transient ember-vz/VZ crash or readiness timeout surfaces as
+    /// `EmberVzStartFailed` wrapping an `Error::Vm` (see
+    /// `read_mac_from_ready_fd` in the macOS backend): the macOS vmnet layer
+    /// can poison a slot so every VM assigned to it crashes the same way, and
+    /// the next slot usually boots. A hard failure such as a missing
+    /// `ember-vz` binary is returned as `CommandExec` *before* wrapping, so it
+    /// never matches here — retrying that would just fail again.
+    pub fn is_transient_vz_start(&self) -> bool {
+        matches!(
+            self,
+            Error::EmberVzStartFailed { source, .. } if matches!(source.as_ref(), Error::Vm(_))
+        )
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -261,24 +278,5 @@ mod tests {
             preserved_log_path: None,
         };
         assert!(err.source().is_some());
-    }
-}
-
-impl Error {
-    /// Create a `Command` error from a finished `std::process::Output`.
-    ///
-    /// Returns `Ok(output)` if the command succeeded.
-    pub fn check_command(
-        command: &str,
-        output: std::process::Output,
-    ) -> Result<std::process::Output> {
-        if output.status.success() {
-            return Ok(output);
-        }
-        Err(Error::Command {
-            command: command.to_string(),
-            exit_code: output.status.code().unwrap_or(-1),
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        })
     }
 }

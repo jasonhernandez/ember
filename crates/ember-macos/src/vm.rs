@@ -84,6 +84,11 @@ impl VmBackend for MacosVm {
     /// Guest IP discovery (via vmnet DHCP leases) is handled separately
     /// by the network backend.
     fn start(vm: &VmMetadata, config: &GlobalConfig) -> Result<StartedVm> {
+        // Test-only: simulate transient VZ start crashes to exercise the
+        // start-retry loop deterministically (SEC-345/419). No-op unless
+        // EMBER_VZ_FAULT_INJECT is set; compiled out of release builds.
+        maybe_inject_start_fault()?;
+
         // Derive paths for the VM's serial console log.
         // The log lives next to vm.json in the VM directory.
         let vm_dir = config.state_dir.join("vms").join(&vm.name);
@@ -353,6 +358,53 @@ fn build_boot_args(vm: &VmMetadata) -> String {
     } else {
         base.to_string()
     }
+}
+
+/// Test-only fault injection for the VM-start retry path (SEC-345/419).
+///
+/// When `EMBER_VZ_FAULT_INJECT=N` is set, the first N calls to
+/// [`MacosVm::start`] in this process return a simulated transient VZ crash
+/// (`EmberVzStartFailed` wrapping `Error::Vm`, the variant the retry loop
+/// treats as retriable) *without* spawning ember-vz. This lets an integration
+/// test drive the slot-poisoning retry deterministically: with `N` faults the
+/// VM lands `N` slots higher than it otherwise would. The counter is
+/// process-global and read once via the env var. Compiled out of release.
+#[cfg(debug_assertions)]
+fn maybe_inject_start_fault() -> Result<()> {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::OnceLock;
+
+    static REMAINING: OnceLock<AtomicU32> = OnceLock::new();
+    let counter = REMAINING.get_or_init(|| {
+        let n = std::env::var("EMBER_VZ_FAULT_INJECT")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(0);
+        AtomicU32::new(n)
+    });
+
+    let consumed = counter
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| {
+            (c > 0).then(|| c - 1)
+        })
+        .is_ok();
+    if consumed {
+        return Err(Error::EmberVzStartFailed {
+            source: Box::new(Error::Vm(
+                "ember-vz closed ready-fd without writing MAC address \
+                 (VM may have crashed) [injected: EMBER_VZ_FAULT_INJECT]"
+                    .to_string(),
+            )),
+            stderr_tail: vec!["injected transient VZ fault".to_string()],
+            preserved_log_path: None,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+fn maybe_inject_start_fault() -> Result<()> {
+    Ok(())
 }
 
 /// Read the guest MAC address from the ready-fd pipe with a timeout.
