@@ -130,6 +130,52 @@ look-alikes like `/tmpfoo` are rejected). Anything outside `/tmp` is silently
 skipped rather than removed. Invalid glob patterns are skipped without failing
 the whole request. An empty `globs` list is a no-op (`{"removed":[]}`).
 
+### task_checkpoint
+
+```
+-> {"op":"task_checkpoint","name":"before-rate-limit"}
+<- {"checkpoint_id":"cp-1716000000-abcd1234"}
+```
+
+Snapshots the agent workspace (`/home/ubuntu/workspace`) plus the
+`/tmp/thermite-*` and `/tmp/agent-*` scratch files into
+`/var/lib/emberd/checkpoints/<id>/` and returns the generated checkpoint id.
+The optional `name` is recorded in the checkpoint manifest as a human label.
+
+The workspace tree is cloned copy-on-write via `cp --reflink=always` (btrfs /
+XFS / ZFS reflinks) when the filesystem supports it; otherwise emberd **falls
+back to `tar + gzip`**. The snapshot is written under a `.staging-<id>` name
+and renamed into place only once complete, so a crash mid-checkpoint never
+leaves a partial snapshot under a usable id.
+
+**Disk-quota guard**: a checkpoint is refused with an `error` if the checkpoint
+area (existing checkpoints plus this one's source size) would exceed **1 GiB**.
+
+Requests may override the defaults — `workspace`, `checkpoint_root`,
+`tmp_globs` (array), and `quota_bytes` — primarily for testing.
+
+### task_restore
+
+```
+-> {"op":"task_restore","checkpoint_id":"cp-1716000000-abcd1234"}
+<- {"ok":true,"restored_count":123}
+```
+
+Replaces the live workspace and scratch files with checkpoint `<id>`.
+`restored_count` is the number of workspace entries plus scratch files restored.
+
+The workspace swap is **atomic**: the snapshot is materialised into a sibling
+staging directory, the live workspace is moved aside, the staging directory is
+renamed into place, and only then is the old tree removed. If the swap fails
+the live workspace is rolled back so it is never lost. Scratch files matching
+the checkpoint's globs are removed and replaced with the snapshotted copies.
+
+The `checkpoint_id` is validated (no path traversal); an unknown or malformed
+id returns an `error` with no filesystem changes.
+
+> The Thermite-side `EmberdClient.task_checkpoint()/.task_restore()` typed
+> wrappers are a separate follow-up in the Thermite repo.
+
 ## Build
 
 ```bash
@@ -163,9 +209,10 @@ cargo test -p emberd
 
 Tests cover all operations, error handling, the agent_reap SIGTERM/SIGKILL
 escalation path, the workspace_reset and fs_clean path-validation and delete
-logic, the enhanced agent_status fields, and full UDS integration roundtrips
-(dedicated `tests/test_workspace_reset.rs`, `tests/test_fs_clean.rs`, and
-`tests/test_agent_status.rs`).
+logic, the enhanced agent_status fields, the checkpoint/restore roundtrip
+(CoW or tar fallback, atomic swap, quota guard), and full UDS integration
+roundtrips (dedicated `tests/test_workspace_reset.rs`, `tests/test_fs_clean.rs`,
+`tests/test_agent_status.rs`, and `tests/test_checkpoint.rs`).
 
 ## Image integration
 
