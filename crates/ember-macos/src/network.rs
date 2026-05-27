@@ -44,8 +44,24 @@ impl NetworkBackend for MacosNetwork {
     ///
     /// The IP is passed to the kernel via boot args (`ip=<guest>::...`)
     /// so the guest has connectivity immediately at boot — no DHCP needed.
-    fn setup(&self, vm: &VmMetadata, _config: &GlobalConfig) -> Result<NetworkInfo> {
-        let allocation = network::ip::allocate(&self.store, VMNET_SUBNET, &vm.name)?;
+    fn setup(&self, vm: &VmMetadata, config: &GlobalConfig) -> Result<NetworkInfo> {
+        self.setup_excluding(vm, config, &std::collections::HashSet::new())
+    }
+
+    /// Allocate a static guest IP, skipping poisoned vmnet slots (SEC-419).
+    ///
+    /// On retry after a transient VZ boot crash, `exclude` carries the /30
+    /// block indexes whose VMs just failed to start; the allocator hands out
+    /// the next free block so we don't re-use a slot the vmnet framework is
+    /// still holding stale state for.
+    fn setup_excluding(
+        &self,
+        vm: &VmMetadata,
+        _config: &GlobalConfig,
+        exclude: &std::collections::HashSet<u32>,
+    ) -> Result<NetworkInfo> {
+        let allocation =
+            network::ip::allocate_excluding(&self.store, VMNET_SUBNET, &vm.name, exclude)?;
 
         Ok(NetworkInfo {
             tap_device: String::new(),

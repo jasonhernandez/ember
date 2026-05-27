@@ -119,6 +119,25 @@ pub enum Error {
     },
 }
 
+impl Error {
+    /// True if this is a VM-start failure likely to succeed when retried on a
+    /// *different* network slot (SEC-419).
+    ///
+    /// A transient ember-vz/VZ crash or readiness timeout surfaces as
+    /// `EmberVzStartFailed` wrapping an `Error::Vm` (see
+    /// `read_mac_from_ready_fd` in the macOS backend): the macOS vmnet layer
+    /// can poison a slot so every VM assigned to it crashes the same way, and
+    /// the next slot usually boots. A hard failure such as a missing
+    /// `ember-vz` binary is returned as `CommandExec` *before* wrapping, so it
+    /// never matches here — retrying that would just fail again.
+    pub fn is_transient_vz_start(&self) -> bool {
+        matches!(
+            self,
+            Error::EmberVzStartFailed { source, .. } if matches!(source.as_ref(), Error::Vm(_))
+        )
+    }
+}
+
 /// Render the multi-line diagnostic message for `Error::EmberVzStartFailed`.
 ///
 /// Format mirrors what `crates/ember-macos/src/vm.rs` was previously building
@@ -200,6 +219,34 @@ mod tests {
         };
         let rendered = err.to_string();
         assert_eq!(rendered, "vm: ready-fd closed");
+    }
+
+    #[test]
+    fn is_transient_vz_start_true_for_ready_fd_crash() {
+        // The retriable case: ember-vz crashed at boot (ready-fd / timeout),
+        // surfaced as EmberVzStartFailed wrapping Error::Vm. SEC-419.
+        let err = Error::EmberVzStartFailed {
+            source: Box::new(Error::Vm(
+                "ember-vz closed ready-fd without writing MAC address".to_string(),
+            )),
+            stderr_tail: vec![],
+            preserved_log_path: None,
+        };
+        assert!(err.is_transient_vz_start());
+    }
+
+    #[test]
+    fn is_transient_vz_start_false_for_non_vm_inner_and_bare_errors() {
+        // Wrapping a non-Vm cause is not treated as a retriable slot crash.
+        let wrapped_network = Error::EmberVzStartFailed {
+            source: Box::new(Error::Network("subnet mismatch".to_string())),
+            stderr_tail: vec![],
+            preserved_log_path: None,
+        };
+        assert!(!wrapped_network.is_transient_vz_start());
+
+        // A bare Vm error (not the wrapped start variant) is not retriable here.
+        assert!(!Error::Vm("some other failure".to_string()).is_transient_vz_start());
     }
 
     #[test]

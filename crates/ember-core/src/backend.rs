@@ -297,6 +297,22 @@ pub trait NetworkBackend {
     /// macOS: no-op (vmnet handles everything); returns vmnet gateway info.
     fn setup(&self, vm: &VmMetadata, config: &GlobalConfig) -> Result<NetworkInfo>;
 
+    /// Like [`NetworkBackend::setup`], but skips the given poisoned /30 block
+    /// indexes when allocating (SEC-419 retry path).
+    ///
+    /// The default ignores `exclude` and delegates to [`NetworkBackend::setup`]
+    /// — correct for backends without vmnet slot poisoning (Linux TAP). The
+    /// macOS backend overrides this to route around slots whose VMs just
+    /// crashed at boot.
+    fn setup_excluding(
+        &self,
+        vm: &VmMetadata,
+        config: &GlobalConfig,
+        _exclude: &std::collections::HashSet<u32>,
+    ) -> Result<NetworkInfo> {
+        self.setup(vm, config)
+    }
+
     /// Tear down networking for a VM.
     ///
     /// Linux: removes iptables rules, deletes TAP device, releases IP.
