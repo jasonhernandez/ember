@@ -5,7 +5,7 @@
 //! by Thermite's `EmberdClient` (`daemon_client.py`).
 //!
 //! Operations: ping, exec, read_file, write_file, agent_status, agent_reap,
-//! vm_stats, workspace_reset.
+//! vm_stats, workspace_reset, fs_clean.
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use clap::Parser;
@@ -165,6 +165,7 @@ fn dispatch(req: &Value) -> Value {
         "agent_reap" => op_agent_reap(),
         "vm_stats" => op_vm_stats(),
         "workspace_reset" => op_workspace_reset(req),
+        "fs_clean" => op_fs_clean(req),
         _ => json!({"error": format!("unknown op: {op}")}),
     }
 }
@@ -236,25 +237,70 @@ fn op_write_file(req: &Value) -> Value {
     }
 }
 
+/// Path of the agent's streamed output log; its byte length is reported as
+/// `stream_offset` so a poller can skip re-reading bytes it already has.
+const AGENT_STREAM_PATH: &str = "/tmp/agent-output.jsonl";
+
+/// Path of the agent's final result file; its mtime is reported as
+/// `result_mtime` so a poller can detect "done + result written" early.
+const AGENT_RESULT_PATH: &str = "/tmp/thermite-result.json";
+
+/// Report agent liveness plus the telemetry a poller needs to avoid no-op
+/// polls: the agent pid and RSS, the current size of the output stream, and
+/// the mtime of the result file. All fields fall back to sensible defaults
+/// when no agent is running or the files are absent.
 fn op_agent_status() -> Value {
     let pid = find_agent_pid();
-    let task_id = std::fs::read_to_string("/tmp/thermite-task-id")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+    let rss_kb = pid.and_then(read_rss_kb).unwrap_or(0);
+    let stream_offset = std::fs::metadata(AGENT_STREAM_PATH)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let result_mtime = file_mtime_secs(AGENT_RESULT_PATH).unwrap_or(0);
 
-    match pid {
-        Some(pid) => json!({
-            "running": true,
-            "pid": pid,
-            "task_id": task_id,
-        }),
-        None => json!({
-            "running": false,
-            "pid": null,
-            "task_id": null,
-        }),
+    json!({
+        "alive": pid.is_some(),
+        "pid": pid,
+        "rss_kb": rss_kb,
+        "stream_offset": stream_offset,
+        "result_mtime": result_mtime,
+    })
+}
+
+/// Delete files matching the given shell globs. Path-validated and
+/// **fails closed**: every expanded path must sit strictly under `/tmp`
+/// (absolute, no `..` component); anything outside is silently skipped.
+/// Only regular files are removed — directories are left untouched.
+/// Returns the list of paths actually removed.
+fn op_fs_clean(req: &Value) -> Value {
+    let Some(globs) = req.get("globs").and_then(Value::as_array) else {
+        return json!({"error": "missing 'globs' field"});
+    };
+
+    let mut removed: Vec<String> = Vec::new();
+    for g in globs {
+        let Some(pattern) = g.as_str() else {
+            continue;
+        };
+        let Ok(paths) = glob::glob(pattern) else {
+            continue; // invalid pattern: skip rather than fail the whole op
+        };
+        for entry in paths.flatten() {
+            if !path_under_tmp(&entry) {
+                continue; // fail closed: never touch anything outside /tmp
+            }
+            // Only remove regular files / symlinks, never directories.
+            if let Ok(meta) = std::fs::symlink_metadata(&entry) {
+                if meta.file_type().is_dir() {
+                    continue;
+                }
+            }
+            if std::fs::remove_file(&entry).is_ok() {
+                removed.push(entry.to_string_lossy().into_owned());
+            }
+        }
     }
+
+    json!({"removed": removed})
 }
 
 /// Kill all `claude` agent subprocesses (matching the `claude --model` argv
@@ -475,6 +521,41 @@ fn read_proc_uptime() -> Option<f64> {
         .next()?
         .parse()
         .ok()
+}
+
+/// Read a process's resident set size (kB) from `/proc/<pid>/status` (`VmRSS`).
+/// Returns `None` if the process is gone or the field is missing.
+fn read_rss_kb(pid: u32) -> Option<u64> {
+    let content = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            return rest.split_whitespace().next().and_then(|s| s.parse().ok());
+        }
+    }
+    None
+}
+
+/// Modification time of `path` as whole seconds since the Unix epoch.
+/// Returns `None` if the file is absent or its mtime is unavailable.
+fn file_mtime_secs(path: &str) -> Option<u64> {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
+/// True if `path` is safe for `fs_clean`: absolute, no `..` component, and
+/// strictly under `/tmp/`. Component-based prefix matching rejects look-alikes
+/// like `/tmpfoo`. Fails closed — anything else returns false.
+fn path_under_tmp(path: &Path) -> bool {
+    path.is_absolute()
+        && !path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        && path.starts_with("/tmp")
+        && path != Path::new("/tmp")
 }
 
 /// Scan /proc for a process whose cmdline contains "thermite-entrypoint".
@@ -865,10 +946,120 @@ mod tests {
 
     #[test]
     fn agent_status_not_running() {
-        // No thermite-entrypoint process is running during tests.
+        // No thermite-entrypoint process is running during tests, so the agent
+        // is not alive and pid is null. The remaining fields are always present
+        // with sensible defaults (0 when the backing file is absent).
         let resp = dispatch(&json!({"op": "agent_status"}));
-        assert_eq!(resp["running"], false);
+        assert_eq!(resp["alive"], false);
         assert!(resp["pid"].is_null());
+        assert!(resp["rss_kb"].is_u64(), "rss_kb should always be present");
+        assert!(
+            resp["stream_offset"].is_u64(),
+            "stream_offset should always be present"
+        );
+        assert!(
+            resp["result_mtime"].is_u64(),
+            "result_mtime should always be present"
+        );
+    }
+
+    // -- fs_clean tests --
+
+    #[test]
+    fn path_under_tmp_accepts_tmp_paths() {
+        assert!(path_under_tmp(Path::new("/tmp/foo")));
+        assert!(path_under_tmp(Path::new("/tmp/a/b/c.json")));
+    }
+
+    #[test]
+    fn path_under_tmp_rejects_unsafe() {
+        // Outside /tmp.
+        assert!(!path_under_tmp(Path::new("/etc/passwd")));
+        assert!(!path_under_tmp(Path::new("/home/ubuntu/secret")));
+        // Bare /tmp is rejected (must be strictly under).
+        assert!(!path_under_tmp(Path::new("/tmp")));
+        // Prefix look-alike is not a real descendant.
+        assert!(!path_under_tmp(Path::new("/tmpfoo")));
+        // Traversal and relative paths.
+        assert!(!path_under_tmp(Path::new("/tmp/../etc/passwd")));
+        assert!(!path_under_tmp(Path::new("relative/path")));
+    }
+
+    #[test]
+    fn fs_clean_missing_globs() {
+        let resp = dispatch(&json!({"op": "fs_clean"}));
+        assert!(resp["error"].as_str().unwrap().contains("globs"));
+    }
+
+    #[test]
+    fn fs_clean_empty_globs_is_noop() {
+        let resp = dispatch(&json!({"op": "fs_clean", "globs": []}));
+        assert!(resp["removed"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn fs_clean_no_matches_returns_empty() {
+        let pat = format!("/tmp/emberd-fsclean-nomatch-{}-*", std::process::id());
+        let resp = dispatch(&json!({"op": "fs_clean", "globs": [pat]}));
+        assert!(resp["removed"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn fs_clean_removes_matching_files() {
+        let uniq = format!("emberd-fsclean-{}", std::process::id());
+        let base = std::env::temp_dir().join(&uniq);
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let f1 = base.join("thermite-result.json");
+        let f2 = base.join("agent-output.jsonl");
+        let keep = base.join("keep.txt");
+        std::fs::write(&f1, b"a").unwrap();
+        std::fs::write(&f2, b"b").unwrap();
+        std::fs::write(&keep, b"c").unwrap();
+
+        // Match only the thermite-*/agent-* style files, leaving keep.txt.
+        let g1 = format!("{}/thermite-*", base.display());
+        let g2 = format!("{}/agent-*", base.display());
+        let resp = dispatch(&json!({"op": "fs_clean", "globs": [g1, g2]}));
+
+        let removed: Vec<String> = resp["removed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(removed.len(), 2, "resp: {resp}");
+        assert!(!f1.exists(), "thermite-result.json should be removed");
+        assert!(!f2.exists(), "agent-output.jsonl should be removed");
+        assert!(keep.exists(), "non-matching file should be kept");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn fs_clean_skips_directories() {
+        let base = std::env::temp_dir().join(format!("emberd-fsclean-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("subdir-match")).unwrap();
+
+        let pat = format!("{}/subdir-*", base.display());
+        let resp = dispatch(&json!({"op": "fs_clean", "globs": [pat]}));
+        assert!(resp["removed"].as_array().unwrap().is_empty());
+        assert!(base.join("subdir-match").exists(), "dir must be kept");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn fs_clean_fails_closed_outside_tmp() {
+        // A pattern that matches files outside /tmp must remove nothing, even
+        // when real files match the glob. We only assert on the removed list
+        // (and never actually delete) thanks to the /tmp validation.
+        let resp = dispatch(&json!({"op": "fs_clean", "globs": ["/etc/hostnam*"]}));
+        assert!(
+            resp["removed"].as_array().unwrap().is_empty(),
+            "must not remove anything outside /tmp: {resp}"
+        );
     }
 
     // -- agent_reap tests --
