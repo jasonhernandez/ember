@@ -4,7 +4,7 @@
 //! (testing) and serves JSON-lines requests. Matches the protocol expected
 //! by Thermite's `EmberdClient` (`daemon_client.py`).
 //!
-//! Operations: ping, exec, read_file, write_file, agent_status, vm_stats.
+//! Operations: ping, exec, read_file, write_file, agent_status, agent_reap, vm_stats.
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use clap::Parser;
@@ -160,6 +160,7 @@ fn dispatch(req: &Value) -> Value {
         "read_file" => op_read_file(req),
         "write_file" => op_write_file(req),
         "agent_status" => op_agent_status(),
+        "agent_reap" => op_agent_reap(),
         "vm_stats" => op_vm_stats(),
         _ => json!({"error": format!("unknown op: {op}")}),
     }
@@ -251,6 +252,19 @@ fn op_agent_status() -> Value {
             "task_id": null,
         }),
     }
+}
+
+/// Kill all `claude` agent subprocesses (matching the `claude --model` argv
+/// pattern): SIGTERM, wait up to 5s, then SIGKILL any stragglers. Returns the
+/// PIDs that were targeted for observability. No-op safe: when no claude
+/// processes are running, returns an empty list with success.
+fn op_agent_reap() -> Value {
+    let pids = find_claude_pids();
+    let killed = reap_pids(&pids);
+    json!({
+        "killed_pids": killed,
+        "process_count": killed.len(),
+    })
 }
 
 fn op_vm_stats() -> Value {
@@ -431,6 +445,102 @@ fn find_agent_pid() -> Option<u32> {
     None
 }
 
+/// True if a `/proc/<pid>/cmdline` (NUL-separated argv) looks like a `claude`
+/// agent invocation: argv[0] basename is `claude` and `--model` is present.
+fn cmdline_matches_claude(cmdline: &str) -> bool {
+    let args: Vec<&str> = cmdline.split('\0').filter(|s| !s.is_empty()).collect();
+    let has_claude = args.iter().any(|a| {
+        let base = a.rsplit('/').next().unwrap_or(a);
+        base == "claude"
+    });
+    let has_model = args.contains(&"--model");
+    has_claude && has_model
+}
+
+/// Scan /proc for all processes whose cmdline matches the claude agent pattern.
+/// Excludes our own pid. Returns an empty vec when /proc is unavailable.
+fn find_claude_pids() -> Vec<u32> {
+    let mut pids = Vec::new();
+    let Ok(proc_dir) = std::fs::read_dir("/proc") else {
+        return pids;
+    };
+    let self_pid = std::process::id();
+    for entry in proc_dir.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        let Ok(pid) = name_str.parse::<u32>() else {
+            continue;
+        };
+        if pid == self_pid {
+            continue;
+        }
+        let Ok(cmdline) = std::fs::read_to_string(format!("/proc/{pid}/cmdline")) else {
+            continue;
+        };
+        if cmdline_matches_claude(&cmdline) {
+            pids.push(pid);
+        }
+    }
+    pids
+}
+
+/// SIGTERM the given pids, wait up to `grace` for them to exit, then SIGKILL
+/// any that remain. Returns the pids that were targeted.
+#[cfg(target_os = "linux")]
+fn reap_pids_with_grace(pids: &[u32], grace: std::time::Duration) -> Vec<u32> {
+    use nix::sys::signal::{kill, Signal};
+    use nix::unistd::Pid;
+    use std::time::{Duration, Instant};
+
+    if pids.is_empty() {
+        return Vec::new();
+    }
+
+    for &pid in pids {
+        let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
+    }
+
+    let deadline = Instant::now() + grace;
+    loop {
+        let alive: Vec<u32> = pids.iter().copied().filter(|&p| process_alive(p)).collect();
+        if alive.is_empty() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            for &pid in &alive {
+                let _ = kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
+            }
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    pids.to_vec()
+}
+
+#[cfg(target_os = "linux")]
+fn reap_pids(pids: &[u32]) -> Vec<u32> {
+    reap_pids_with_grace(pids, std::time::Duration::from_secs(5))
+}
+
+/// True if a process with the given pid currently exists (signal 0 probe).
+#[cfg(target_os = "linux")]
+fn process_alive(pid: u32) -> bool {
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+    kill(Pid::from_raw(pid as i32), None).is_ok()
+}
+
+/// Non-Linux fallback: no signal support (nix is a Linux-only dependency), and
+/// /proc scanning yields no pids, so reaping is a no-op.
+#[cfg(not(target_os = "linux"))]
+fn reap_pids(pids: &[u32]) -> Vec<u32> {
+    let _ = pids;
+    Vec::new()
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -538,6 +648,78 @@ mod tests {
         let resp = dispatch(&json!({"op": "agent_status"}));
         assert_eq!(resp["running"], false);
         assert!(resp["pid"].is_null());
+    }
+
+    // -- agent_reap tests --
+    //
+    // NOTE: these tests deliberately never call op_agent_reap()/find_claude_pids()
+    // against the live /proc. On a real agent host an actual `claude --model`
+    // process is running, and reaping it would kill the test runner itself. We
+    // exercise the pure matcher and the reap logic against spawned dummy pids.
+
+    #[test]
+    fn cmdline_matches_claude_positive() {
+        assert!(cmdline_matches_claude("claude\0--model\0opus\0"));
+        assert!(cmdline_matches_claude(
+            "/usr/local/bin/claude\0--model\0sonnet\0--verbose\0"
+        ));
+    }
+
+    #[test]
+    fn cmdline_matches_claude_negative() {
+        assert!(!cmdline_matches_claude(""));
+        assert!(!cmdline_matches_claude("bash\0-c\0echo hi\0"));
+        // claude without --model
+        assert!(!cmdline_matches_claude("claude\0--help\0"));
+        // --model without a claude binary
+        assert!(!cmdline_matches_claude("python\0--model\0foo\0"));
+        // substring that is not the binary basename
+        assert!(!cmdline_matches_claude("claudette\0--model\0x\0"));
+    }
+
+    #[test]
+    fn reap_empty_is_noop() {
+        // No-op safe: empty input yields an empty list, no signals sent.
+        assert!(reap_pids(&[]).is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reap_terminates_child_via_sigterm() {
+        use std::process::Command;
+        use std::time::Duration;
+
+        let mut child = Command::new("sleep").arg("300").spawn().unwrap();
+        let pid = child.id();
+        assert!(process_alive(pid));
+
+        let killed = reap_pids_with_grace(&[pid], Duration::from_millis(500));
+        assert_eq!(killed, vec![pid]);
+
+        let _ = child.wait(); // reap the zombie now that it has exited
+        assert!(!process_alive(pid));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reap_escalates_to_sigkill_for_sigterm_ignorer() {
+        use std::process::Command;
+        use std::time::Duration;
+
+        // This child ignores SIGTERM; only SIGKILL can stop it.
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("trap '' TERM; sleep 300")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        assert!(process_alive(pid));
+
+        let killed = reap_pids_with_grace(&[pid], Duration::from_millis(300));
+        assert_eq!(killed, vec![pid]);
+
+        let _ = child.wait();
+        assert!(!process_alive(pid));
     }
 
     #[test]
