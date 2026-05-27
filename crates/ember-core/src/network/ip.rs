@@ -205,6 +205,53 @@ pub fn allocated_block(store: &StateStore, vm_name: &str) -> Result<Option<u32>>
     Ok(block)
 }
 
+/// One row of the network allocation table, with IPs resolved.
+///
+/// Returned by [`list_allocations`] for `ember network status`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AllocationRow {
+    pub block_index: u32,
+    pub subnet: String,
+    pub vm_name: String,
+    pub host_ip: String,
+    pub guest_ip: String,
+}
+
+/// List every recorded /30 allocation, ordered by subnet then block index.
+///
+/// Powers `ember network status` (SEC-419): operators can see which slots
+/// are in use and by which VM without reading the state DB directly.
+pub fn list_allocations(store: &StateStore) -> Result<Vec<AllocationRow>> {
+    let conn = db::open(store.root())?;
+    let mut stmt = conn.prepare(
+        "SELECT block_index, subnet, vm_name FROM network_allocations \
+         ORDER BY subnet, block_index",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, u32>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for (block_index, subnet, vm_name) in rows {
+        let (base, _prefix) = parse_cidr(&subnet)?;
+        let ips = block_ips(base, block_index);
+        out.push(AllocationRow {
+            block_index,
+            subnet,
+            vm_name,
+            host_ip: ips.host_ip,
+            guest_ip: ips.guest_ip,
+        });
+    }
+    Ok(out)
+}
+
 /// Release a VM's IP allocation.
 ///
 /// Removes all allocation entries for the given VM name, making the /30
@@ -526,6 +573,28 @@ mod tests {
 
         release(&store, "vm2").unwrap();
         assert_eq!(allocated_block(&store, "vm2").unwrap(), None);
+    }
+
+    #[test]
+    fn list_allocations_reports_rows_with_resolved_ips() {
+        let (_dir, store) = test_store();
+        allocate(&store, "10.100.0.0/16", "vm1").unwrap();
+        allocate(&store, "10.100.0.0/16", "vm2").unwrap();
+        release(&store, "vm1").unwrap();
+
+        let rows = list_allocations(&store).unwrap();
+        // Only vm2 remains; IPs are resolved from its block index.
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].vm_name, "vm2");
+        assert_eq!(rows[0].block_index, 1);
+        assert_eq!(rows[0].guest_ip, "10.100.0.6");
+        assert_eq!(rows[0].host_ip, "10.100.0.5");
+    }
+
+    #[test]
+    fn list_allocations_empty_when_none() {
+        let (_dir, store) = test_store();
+        assert!(list_allocations(&store).unwrap().is_empty());
     }
 
     #[test]

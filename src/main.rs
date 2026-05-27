@@ -4,6 +4,7 @@ pub mod image;
 
 use clap::Parser;
 use cli::kernel::KernelCommand;
+use cli::network::NetworkCommand;
 use cli::vm::VmCommand;
 use cli::{Cli, Command};
 
@@ -37,6 +38,7 @@ fn needs_root(command: &Command) -> bool {
             | Command::Cp(_)
             | Command::Vm(VmCommand::List(_) | VmCommand::Inspect(_) | VmCommand::Stats(_))
             | Command::Kernel(KernelCommand::List)
+            | Command::Network(NetworkCommand::Status(_))
     )
 }
 
@@ -57,6 +59,7 @@ fn needs_reconcile(command: &Command) -> bool {
             | Command::Cp(_)
             | Command::Vm(VmCommand::List(_) | VmCommand::Inspect(_) | VmCommand::Stats(_))
             | Command::Kernel(_)
+            | Command::Network(NetworkCommand::Status(_))
     )
 }
 
@@ -79,6 +82,7 @@ fn main() -> anyhow::Result<()> {
         Command::Image(cmd) => cli::image::run(cmd, &cli.state_dir),
         Command::Kernel(cmd) => cli::kernel::run(cmd, &cli.state_dir),
         Command::Snapshot(cmd) => cli::snapshot::run(cmd, &cli.state_dir),
+        Command::Network(cmd) => cli::network::run(cmd, &cli.state_dir),
         Command::Ssh(args) => cli::ssh::run(args, &cli.state_dir),
         Command::Exec(args) => cli::exec::run(args, &cli.state_dir),
         Command::Cp(args) => cli::cp::run(args, &cli.state_dir),
