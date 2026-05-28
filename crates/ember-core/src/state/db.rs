@@ -78,7 +78,33 @@ pub fn open(root: &Path) -> Result<Connection> {
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.execute_batch(SCHEMA)?;
+    check_schema_drift(&conn)?;
     Ok(conn)
+}
+
+/// Detect pre-merge `state.db` files that pre-date the `single_address`
+/// column on `network_allocations`. `CREATE TABLE IF NOT EXISTS` is a
+/// no-op when the table already exists, so a stale install's table stays
+/// on the old shape — every `allocate*` call then dies with a raw SQLite
+/// "no such column: single_address" error that doesn't tell the operator
+/// what to do. Surface a clear cut-over message instead.
+///
+/// No-op for a fresh install (the `CREATE` above just stamped the new
+/// shape) and after the documented drain + `rm state.db` + `ember init`.
+fn check_schema_drift(conn: &Connection) -> Result<()> {
+    let has_single_address: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('network_allocations') WHERE name = 'single_address'")?
+        .exists([])?;
+    if !has_single_address {
+        return Err(crate::error::Error::State(
+            "state.db pre-dates the dual-strategy allocator (`single_address` column missing). \
+             This is a one-way schema change; see the upstream-sync PR for the cut-over procedure: \
+             stop all VMs (`thermite collect && thermite pool stop`), remove the state DB \
+             (`sudo rm <state_dir>/state.db`), then re-init (`ember init`)."
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -112,6 +138,32 @@ mod tests {
         let _conn1 = open(dir.path()).unwrap();
         // Re-opening must not fail or duplicate the schema.
         let _conn2 = open(dir.path()).unwrap();
+    }
+
+    #[test]
+    fn open_detects_pre_merge_schema_and_emits_cutover_guidance() {
+        // Simulate a stale state.db that pre-dates the dual-strategy
+        // allocator: the old shape (no `single_address` column). The
+        // operator should get a friendly cut-over message, not a raw
+        // SQLite "no such column" error on the next allocate.
+        let dir = tmp_root();
+        let path = db_path(dir.path());
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE network_allocations (
+                block_index INTEGER NOT NULL,
+                subnet      TEXT    NOT NULL,
+                vm_name     TEXT    NOT NULL UNIQUE,
+                PRIMARY KEY (subnet, block_index)
+            ) STRICT;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let err = open(dir.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("single_address"), "got: {msg}");
+        assert!(msg.contains("ember init"), "got: {msg}");
     }
 
     #[test]
