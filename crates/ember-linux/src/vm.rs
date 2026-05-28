@@ -16,7 +16,6 @@ use std::time::Duration;
 
 use crate::firecracker;
 use crate::network;
-use crate::zfs;
 use ember_core::backend::{StartedVm, VmBackend};
 use ember_core::config::GlobalConfig;
 use ember_core::error::{Error, Result};
@@ -38,7 +37,7 @@ impl VmBackend for LinuxVm {
     /// Expects `vm.network` to be already populated (by `NetworkBackend::setup`).
     /// Spawns the Firecracker process, configures it via the API, and boots.
     /// Returns the hypervisor PID and the network info from the metadata.
-    fn start(vm: &VmMetadata, _config: &GlobalConfig) -> Result<StartedVm> {
+    fn start(vm: &VmMetadata, config: &GlobalConfig) -> Result<StartedVm> {
         let socket_path = &vm.api_socket;
         let log_path = socket_path.with_file_name("firecracker.log");
 
@@ -48,6 +47,13 @@ impl VmBackend for LinuxVm {
                 vm.name
             ))
         })?;
+
+        // Resolve the rootfs through the active storage backend so the
+        // backend (ZFS, dm-thin, …) controls how `vm.disk_path` becomes
+        // the actual device path Firecracker sees. dm-thin lazily
+        // re-activates pool + thin devices here (pool tables are
+        // kernel-only state that vanishes on host reboot).
+        let rootfs_path = crate::create_storage(config).disk_device_path(vm)?;
 
         // Clean up stale socket from a previous run.
         if socket_path.exists() {
@@ -64,7 +70,7 @@ impl VmBackend for LinuxVm {
 
         // Configure and boot via the Firecracker API.
         // Kill the process on failure to avoid an orphaned Firecracker.
-        match configure_and_boot(vm, socket_path, net_info) {
+        match configure_and_boot(vm, &rootfs_path, socket_path, net_info) {
             Ok(()) => {}
             Err(e) => {
                 let _ = firecracker::process::kill(pid);
@@ -164,9 +170,11 @@ impl VmBackend for LinuxVm {
 ///
 /// Waits for the API socket, builds the VM configuration from metadata
 /// and network info, then issues the API calls to configure and start
-/// the instance.
+/// the instance. `rootfs_path` is the activated disk device path
+/// resolved by the storage backend.
 fn configure_and_boot(
     vm: &VmMetadata,
+    rootfs_path: &std::path::Path,
     socket_path: &std::path::Path,
     net_info: &NetworkInfo,
 ) -> Result<()> {
@@ -179,9 +187,8 @@ fn configure_and_boot(
     let dns_servers = network::dns::detect_nameservers(wan_iface);
 
     // Build VM configuration.
-    let rootfs_path = zfs::volume::device_path(&vm.disk_path);
     let mut vm_config =
-        firecracker::config::VmConfig::new(vm.cpus, vm.memory_mib, &vm.kernel_path, &rootfs_path);
+        firecracker::config::VmConfig::new(vm.cpus, vm.memory_mib, &vm.kernel_path, rootfs_path);
     if let Some(ref boot_args) = vm.boot_args {
         vm_config = vm_config.with_boot_args(boot_args);
     }

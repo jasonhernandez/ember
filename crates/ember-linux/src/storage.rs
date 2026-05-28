@@ -1,4 +1,4 @@
-//! Linux storage backend: ZFS zvols, snapshots, and clones.
+//! Linux storage backend: ZFS zvols and clones.
 //!
 //! Wraps the `zfs::pool`, `zfs::dataset`, `zfs::volume`, and `zfs::snapshot`
 //! modules behind the [`StorageBackend`] trait. On Linux, each VM's rootfs
@@ -11,14 +11,19 @@ use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 
 use crate::zfs;
-use ember_core::backend::{InitConfig, SnapshotInfo, StorageBackend};
+use ember_core::backend::{InitConfig, StorageBackend, VolumeHandle};
 use ember_core::config::size::ByteSize;
 use ember_core::config::GlobalConfig;
 use ember_core::error::{Error, Result};
+use ember_core::image::registry::ImageEntry;
+use ember_core::state::vm::VmMetadata;
 
 /// Linux storage backend using ZFS zvols.
 #[derive(Clone)]
 pub struct LinuxStorage {
+    /// ZFS pool name (e.g., "tank"). Cached so `deinit` can call
+    /// `zpool destroy` without re-reading the config.
+    pool: String,
     /// ZFS images dataset path (e.g., "tank/ember/images").
     images_dataset: String,
     /// ZFS VMs dataset path (e.g., "tank/ember/vms").
@@ -31,6 +36,7 @@ impl LinuxStorage {
     /// Extracts the ZFS pool/dataset paths that all storage operations need.
     pub fn new(config: &GlobalConfig) -> Self {
         Self {
+            pool: config.pool.clone(),
             images_dataset: config.images_dataset(),
             vms_dataset: config.vms_dataset(),
         }
@@ -88,9 +94,12 @@ impl StorageBackend for LinuxStorage {
     }
 
     /// Create a ZFS zvol from an ext4 image, write it via `dd`, and snapshot `@base`.
-    ///
-    /// Returns the zvol path (e.g., "tank/ember/images/library-alpine-latest").
-    fn create_image_volume(&self, name: &str, image_path: &Path, size_mib: u64) -> Result<PathBuf> {
+    fn create_image_volume(
+        &self,
+        name: &str,
+        image_path: &Path,
+        size_mib: u64,
+    ) -> Result<VolumeHandle> {
         let zvol = self.image_zvol(name);
 
         // Create the zvol.
@@ -103,14 +112,12 @@ impl StorageBackend for LinuxStorage {
             return Err(e);
         }
 
-        Ok(PathBuf::from(zvol))
+        Ok(VolumeHandle::from_path(zvol))
     }
 
     /// Clone the image's `@base` snapshot to create a VM zvol.
-    ///
-    /// Returns the zvol path (e.g., "tank/ember/vms/myvm").
-    fn clone_for_vm(&self, image_name: &str, vm_name: &str) -> Result<PathBuf> {
-        let image_zvol = self.image_zvol(image_name);
+    fn clone_for_vm(&self, image: &ImageEntry, vm_name: &str) -> Result<VolumeHandle> {
+        let image_zvol = self.image_zvol(&image.local_name);
         let snapshot = format!("{image_zvol}@{}", zfs::BASE_SNAPSHOT_NAME);
         let vm_zvol = self.vm_zvol(vm_name);
 
@@ -123,43 +130,12 @@ impl StorageBackend for LinuxStorage {
         }
 
         zfs::volume::clone(&snapshot, &vm_zvol)?;
-        Ok(PathBuf::from(vm_zvol))
-    }
-
-    fn snapshot(&self, vm_name: &str, snap_name: &str) -> Result<()> {
-        let zvol = self.vm_zvol(vm_name);
-        zfs::snapshot::create(&zvol, snap_name)
-    }
-
-    fn restore_snapshot(&self, vm_name: &str, snap_name: &str) -> Result<()> {
-        let zvol = self.vm_zvol(vm_name);
-        zfs::snapshot::rollback(&zvol, snap_name)
-    }
-
-    fn delete_snapshot(&self, vm_name: &str, snap_name: &str) -> Result<()> {
-        let zvol = self.vm_zvol(vm_name);
-        zfs::snapshot::destroy(&zvol, snap_name)
-    }
-
-    /// List snapshots, filtering out the reserved `@base` snapshot.
-    fn list_snapshots(&self, vm_name: &str) -> Result<Vec<SnapshotInfo>> {
-        let zvol = self.vm_zvol(vm_name);
-        let zfs_snaps = zfs::snapshot::list(&zvol)?;
-
-        Ok(zfs_snaps
-            .into_iter()
-            .filter(|s| s.short_name != zfs::BASE_SNAPSHOT_NAME)
-            .map(|s| SnapshotInfo {
-                name: s.short_name,
-                created_at: s.creation,
-                size: s.referenced,
-            })
-            .collect())
+        Ok(VolumeHandle::from_path(vm_zvol))
     }
 
     /// Grow the zvol and expand the ext4 filesystem.
-    fn resize(&self, vm_name: &str, new_size: ByteSize) -> Result<()> {
-        let zvol = self.vm_zvol(vm_name);
+    fn resize(&self, vm: &VmMetadata, new_size: ByteSize) -> Result<()> {
+        let zvol = self.vm_zvol(&vm.name);
         let new_gib = new_size
             .to_gib()
             .map_err(|e| Error::Zfs(format!("invalid resize target: {e}")))?;
@@ -175,20 +151,45 @@ impl StorageBackend for LinuxStorage {
         Ok(())
     }
 
-    /// Destroy the VM's zvol and all its snapshots.
-    fn destroy_vm_storage(&self, vm_name: &str) -> Result<()> {
-        let zvol = self.vm_zvol(vm_name);
+    /// Destroy the VM's zvol (and any internal fork snapshots beneath it).
+    fn destroy_vm_storage(&self, vm: &VmMetadata) -> Result<()> {
+        let zvol = self.vm_zvol(&vm.name);
         // Ignore errors — the zvol may already be gone.
         let _ = zfs::volume::destroy(&zvol, true);
         Ok(())
+    }
+
+    fn deinit(&self, _purge: bool) -> Result<()> {
+        // `zpool destroy` is destructive — there is no equivalent of
+        // "purge: keep the data". The flag is accepted for trait
+        // uniformity but ignored here: ZFS pools always go.
+        if !zfs::pool::exists(&self.pool)? {
+            return Ok(());
+        }
+        let output = ProcessCommand::new("zpool")
+            .args(["destroy", "-f", &self.pool])
+            .output()
+            .map_err(|e| Error::CommandExec {
+                command: "zpool destroy".to_string(),
+                source: e,
+            })?;
+        Error::check_command("zpool destroy", output)?;
+        println!("Destroyed ZFS pool '{}'.", self.pool);
+        Ok(())
+    }
+
+    fn grow(&self, _new_size: ByteSize) -> Result<()> {
+        Err(Error::Zfs(
+            "ZFS pools auto-expand by default; use `zpool online -e` if needed".to_string(),
+        ))
     }
 
     /// Destroy the image zvol (includes its @base snapshot).
     ///
     /// With `force: true`, uses `zfs destroy -R` to also destroy any orphaned
     /// dependent clones (VM zvols) that the application layer couldn't clean up.
-    fn destroy_image_storage(&self, name: &str, force: bool) -> Result<()> {
-        let zvol = self.image_zvol(name);
+    fn destroy_image_storage(&self, image: &ImageEntry, force: bool) -> Result<()> {
+        let zvol = self.image_zvol(&image.local_name);
         if force {
             zfs::destroy_with_dependents(&zvol)
         } else {
@@ -197,21 +198,14 @@ impl StorageBackend for LinuxStorage {
     }
 
     /// Device path for a VM's root disk zvol.
-    ///
-    /// Returns the `/dev/zvol/...` path that can be used for mounting
-    /// or passing to Firecracker as a block device.
-    fn disk_device_path(&self, vm_name: &str) -> PathBuf {
-        let zvol = self.vm_zvol(vm_name);
-        zfs::volume::device_path(&zvol)
+    fn disk_device_path(&self, vm: &VmMetadata) -> Result<PathBuf> {
+        let zvol = self.vm_zvol(&vm.name);
+        Ok(zfs::volume::device_path(&zvol))
     }
 
     /// Fork a VM's disk by snapshotting the source and cloning into a new VM.
-    ///
-    /// Internally creates a ZFS snapshot named `fork-{target_vm}` on the source,
-    /// then clones it into the target VM's zvol. The snapshot naming convention
-    /// is entirely internal — the caller only sees the resulting disk path.
-    fn clone_vm_storage(&self, source_vm: &str, target_vm: &str) -> Result<PathBuf> {
-        let source_zvol = self.vm_zvol(source_vm);
+    fn clone_vm_storage(&self, source: &VmMetadata, target_vm: &str) -> Result<VolumeHandle> {
+        let source_zvol = self.vm_zvol(&source.name);
         let target_zvol = self.vm_zvol(target_vm);
         let snap_name = format!("fork-{target_vm}");
 
@@ -227,16 +221,16 @@ impl StorageBackend for LinuxStorage {
             return Err(e);
         }
 
-        Ok(PathBuf::from(target_zvol))
+        Ok(VolumeHandle::from_path(target_zvol))
     }
 
     /// Clean up the fork snapshot on the parent VM.
     ///
     /// Reconstructs the snapshot name from the naming convention:
     /// `{pool}/vms/{parent_vm}@fork-{forked_vm}`.
-    fn cleanup_fork(&self, parent_vm: &str, forked_vm: &str) -> Result<()> {
-        let parent_zvol = self.vm_zvol(parent_vm);
-        let snap_name = format!("fork-{forked_vm}");
+    fn cleanup_fork(&self, parent: &VmMetadata, forked: &VmMetadata) -> Result<()> {
+        let parent_zvol = self.vm_zvol(&parent.name);
+        let snap_name = format!("fork-{}", forked.name);
         match zfs::snapshot::destroy(&parent_zvol, &snap_name) {
             Ok(()) => {}
             Err(e) => {
@@ -249,12 +243,8 @@ impl StorageBackend for LinuxStorage {
     }
 
     /// Check for fork snapshots on this VM's ZFS dataset.
-    ///
-    /// Lists all snapshots matching `fork-*` on the VM's zvol and returns
-    /// the implied dependent VM names. These represent ZFS clones that
-    /// would break if this VM's dataset were destroyed.
-    fn storage_dependents(&self, vm_name: &str) -> Result<Vec<String>> {
-        let zvol = self.vm_zvol(vm_name);
+    fn storage_dependents(&self, vm: &VmMetadata) -> Result<Vec<String>> {
+        let zvol = self.vm_zvol(&vm.name);
         let snapshots = zfs::snapshot::list(&zvol)?;
 
         Ok(snapshots

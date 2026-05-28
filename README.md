@@ -9,18 +9,16 @@ Lightweight CLI for managing microVMs with copy-on-write storage. No daemon, no 
 
 ### macOS (Homebrew)
 
+There are no tagged releases yet, so install from `main` with `--HEAD`:
+
 ```bash
 brew tap aljoscha/ember https://github.com/aljoscha/ember
-brew install ember
-```
-
-This installs both `ember` and `ember-vz` (the Swift helper for Apple Virtualization Framework), plus runtime dependencies (`e2fsprogs`, `skopeo`) and image-build dependencies (`fakeroot`, `gnu-tar`, installed transitively by the formula). Requires macOS 13+ (Ventura) and Xcode Command Line Tools.
-
-To install the latest development version instead of a tagged release:
-
-```bash
 brew install --HEAD aljoscha/ember/ember
 ```
+
+This installs both `ember` and `ember-vz` (the Swift helper for Apple Virtualization Framework), plus runtime dependencies (`e2fsprogs`, `skopeo`). Requires macOS 13+ (Ventura) and Xcode Command Line Tools. The formula builds from source, so the first install takes a few minutes.
+
+Upgrade later with `brew upgrade --fetch-HEAD ember`.
 
 ### macOS (from source)
 
@@ -37,6 +35,17 @@ cargo build --release
 ```
 
 The binary is at `./target/release/ember`.
+
+### Linux (Debian/Ubuntu .deb)
+
+Build a `.deb` package with [`cargo-deb`](https://github.com/kornelski/cargo-deb):
+
+```bash
+cargo install cargo-deb
+cargo deb
+```
+
+The package lands at `./target/debian/ember_<version>_<arch>.deb`. Install with `sudo apt install ./target/debian/ember_<version>_<arch>.deb`. Firecracker is not packaged in Debian/Ubuntu and must be installed separately.
 
 #### Linux dependencies
 
@@ -64,7 +73,7 @@ ember vm create myvm --image ubuntu-dev
 ember ssh myvm
 ```
 
-No `sudo` needed. State is stored in `~/Library/Application Support/ember/`. Storage uses instant APFS copy-on-write clones — creating VMs and snapshots takes milliseconds regardless of disk size.
+No `sudo` needed. State is stored in `~/Library/Application Support/ember/`. Storage uses instant APFS copy-on-write clones — creating and forking VMs takes milliseconds regardless of disk size.
 
 The kernel build requires Docker or Podman and enables Docker networking inside your VMs. It only needs to run once — the kernel is cached for all future VMs. If you don't need Docker inside VMs, skip the `kernel build` step and the stock kernel will be auto-downloaded on first use.
 
@@ -190,23 +199,6 @@ Forks can grow the disk but not shrink it below the source size. Use `--no-start
 ember vm fork base template --no-start
 ```
 
-## Snapshots
-
-Snapshots capture point-in-time state of a VM's disk. Useful for checkpointing before risky changes.
-
-```bash
-ember snapshot create myvm before-upgrade
-ember snapshot list myvm
-
-# Something went wrong? Roll back (VM must be stopped):
-ember vm stop myvm
-ember snapshot restore myvm before-upgrade
-ember vm start myvm
-
-# Clean up:
-ember snapshot delete myvm before-upgrade
-```
-
 ## Guest access
 
 SSH keys are auto-injected at image build and VM creation time. The SSH user is auto-detected (`ubuntu` if `/home/ubuntu` exists, otherwise `root`).
@@ -226,7 +218,7 @@ ember cp myvm:/var/log/syslog ./syslog.txt
 
 ## Storage efficiency
 
-Both platforms use copy-on-write storage, so VMs and snapshots share disk blocks with their parent image. Check actual disk usage:
+Both platforms use copy-on-write storage, so VMs and forks share disk blocks with their parent image. Check actual disk usage:
 
 ```bash
 ember debug storage-efficiency
@@ -295,7 +287,7 @@ The CLI is identical on both platforms. Under the hood:
 | | Linux | macOS |
 |---|---|---|
 | Hypervisor | Firecracker (KVM) | Apple Virtualization Framework |
-| Storage | ZFS zvols + snapshots | APFS clones (`cp -c`) |
+| Storage | ZFS zvols + clones | APFS clones (`cp -c`) |
 | Networking | TAP devices + iptables NAT | vmnet shared mode |
 | Root required | Yes | No |
 | State directory | `/var/lib/ember/` | `~/Library/Application Support/ember/` |

@@ -81,7 +81,6 @@ fn main() -> anyhow::Result<()> {
         Command::Vm(cmd) => cli::vm::run(cmd, &cli.state_dir),
         Command::Image(cmd) => cli::image::run(cmd, &cli.state_dir),
         Command::Kernel(cmd) => cli::kernel::run(cmd, &cli.state_dir),
-        Command::Snapshot(cmd) => cli::snapshot::run(cmd, &cli.state_dir),
         Command::Network(cmd) => cli::network::run(cmd, &cli.state_dir),
         Command::Ssh(args) => cli::ssh::run(args, &cli.state_dir),
         Command::Exec(args) => cli::exec::run(args, &cli.state_dir),
@@ -92,6 +91,8 @@ fn main() -> anyhow::Result<()> {
             CurrentPlatform::reconcile(&cli.state_dir);
             Ok(())
         }
+        Command::Deinit(args) => cli::deinit::run(args, &cli.state_dir),
+        Command::Storage(cmd) => cli::storage::run(cmd, &cli.state_dir),
         Command::Version => {
             println!("ember {}", env!("CARGO_PKG_VERSION"));
             Ok(())

@@ -1,13 +1,28 @@
-//! IP allocation from a configurable /N subnet in /30 blocks.
+//! IP allocation for VM networking.
 //!
-//! Each VM gets a point-to-point /30 link: host gets .1, guest gets .2.
-//! Allocations are tracked in `state.db` (SQLite, see [`crate::state::db`]).
-//! The schema's `(subnet, block_index) PRIMARY KEY` plus `vm_name UNIQUE`
-//! makes double-allocation structurally impossible — the second `INSERT`
-//! for the same slot fails with a constraint violation.
+//! Two allocation strategies, picked per backend:
 //!
-//! With the default /16 subnet (10.100.0.0/16), this supports ~16,384
-//! concurrent VMs.
+//! * [`allocate`] — Linux: hand out `/30` blocks for point-to-point TAP
+//!   routing. Each VM gets its own host (.1) and guest (.2) IPs on a
+//!   dedicated /30. With a `/16` base, ~16,384 VMs fit.
+//! * [`allocate_single`] — macOS: hand out single `/32` addresses on a
+//!   shared subnet (vmnet's `192.168.64.0/24`, optionally sub-sliced
+//!   into per-installation /27s). All VMs sit on the same L2 segment
+//!   behind one shared gateway, so a /30 P2P link per VM would waste
+//!   75% of the address space.
+//!
+//! Both persist into the same `state.db` SQLite database (see
+//! [`crate::state::db`]). The schema's `(subnet, block_index) PRIMARY KEY`
+//! plus `vm_name UNIQUE` constraint makes double-allocation structurally
+//! impossible — a second `INSERT` for the same slot fails with a
+//! constraint violation, so the allocator can't accidentally hand out
+//! the same IP twice even if the read-modify-write logic regresses.
+//!
+//! An installation uses exactly one strategy across its lifetime. The
+//! persisted `subnet` column (singleton invariant: every row's subnet
+//! must match the caller's subnet) plus the `single_address` boolean
+//! enforce this — switching strategies or subnets mid-install would
+//! re-stamp every existing entry's IPs, so the allocator rejects both.
 //!
 //! Concurrency model: each call opens a fresh SQLite connection and runs
 //! the allocation under `BEGIN IMMEDIATE`, which acquires the write lock
@@ -28,13 +43,16 @@ use crate::state::store::StateStore;
 /// A single IP allocation for one VM.
 #[derive(Debug, Clone, PartialEq)]
 pub struct IpAllocation {
-    /// Index of the /30 block within the base subnet.
+    /// Index within the base subnet. Unit is strategy-dependent:
+    /// 4 addresses for [`allocate`] (/30 P2P), 1 for [`allocate_single`].
     pub block_index: u32,
-    /// Host-side IP — first usable address in the /30 (e.g., "10.100.0.1").
+    /// Host-side IP. For [`allocate`]: first usable address in the /30
+    /// (e.g., "10.100.0.1"). For [`allocate_single`]: the shared gateway
+    /// passed by the caller.
     pub host_ip: String,
-    /// Guest-side IP — second usable address in the /30 (e.g., "10.100.0.2").
+    /// Guest-side IP.
     pub guest_ip: String,
-    /// Netmask for the /30 link ("255.255.255.252").
+    /// Netmask for the link.
     pub netmask: String,
 }
 
@@ -44,7 +62,14 @@ pub const DEFAULT_SUBNET: &str = "10.100.0.0/16";
 /// Netmask for a /30 subnet.
 const NETMASK_30: &str = "255.255.255.252";
 
+/// Strategy column values for `network_allocations.single_address`.
+const STRATEGY_P2P: i64 = 0;
+const STRATEGY_SINGLE: i64 = 1;
+
 /// Parse a CIDR subnet string into (base address, prefix length).
+///
+/// Accepts any prefix `/0`..`/32`; per-strategy constraints (e.g.
+/// `/30` minimum for [`allocate`]) are enforced at the call site.
 fn parse_cidr(cidr: &str) -> Result<(Ipv4Addr, u8)> {
     let (ip_str, prefix_str) = cidr
         .split_once('/')
@@ -58,9 +83,9 @@ fn parse_cidr(cidr: &str) -> Result<(Ipv4Addr, u8)> {
         .parse()
         .map_err(|e| Error::Network(format!("invalid prefix in CIDR '{cidr}': {e}")))?;
 
-    if prefix > 30 {
+    if prefix > 32 {
         return Err(Error::Network(format!(
-            "subnet /{prefix} is too small for /30 allocations"
+            "invalid CIDR prefix /{prefix}: must be 0..=32"
         )));
     }
 
@@ -68,6 +93,8 @@ fn parse_cidr(cidr: &str) -> Result<(Ipv4Addr, u8)> {
     let ip_u32 = u32::from(ip);
     let mask = if prefix == 0 {
         0u32
+    } else if prefix == 32 {
+        u32::MAX
     } else {
         !((1u32 << (32 - prefix)) - 1)
     };
@@ -102,10 +129,60 @@ fn block_ips(base: Ipv4Addr, block_index: u32) -> IpAllocation {
     }
 }
 
-/// Allocate a /30 block for a VM.
+/// Verify the persisted subnet (and the strategy column) match the
+/// caller's. Returns `Err` on mismatch — the install would otherwise
+/// re-stamp every existing entry's IPs.
+fn verify_singleton_subnet(
+    tx: &rusqlite::Transaction<'_>,
+    subnet: &str,
+    expected_strategy: i64,
+) -> Result<()> {
+    let row: Option<(String, i64)> = tx
+        .query_row(
+            "SELECT subnet, single_address FROM network_allocations LIMIT 1",
+            [],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+        )
+        .ok();
+    if let Some((existing_subnet, existing_strategy)) = row {
+        if existing_subnet != subnet {
+            return Err(Error::Network(format!(
+                "subnet mismatch: state has '{existing_subnet}', requested '{subnet}'"
+            )));
+        }
+        if existing_strategy != expected_strategy {
+            return Err(Error::Network(format!(
+                "allocation strategy mismatch: state uses {} but caller requested {}",
+                strategy_name(existing_strategy),
+                strategy_name(expected_strategy),
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn strategy_name(s: i64) -> &'static str {
+    match s {
+        STRATEGY_P2P => "/30 P2P (allocate)",
+        STRATEGY_SINGLE => "single-address (allocate_single)",
+        _ => "unknown",
+    }
+}
+
+/// Allocate the lowest free /30 block for a VM, skipping any `exclude`d
+/// block indexes.
 ///
-/// Finds the lowest-numbered available block in the subnet, records the
-/// allocation in `state.db`, and returns the IP addresses for that block.
+/// `exclude` lets the VM-start retry path (SEC-419) route around a "poisoned"
+/// slot: when a VM fails to boot with a transient vmnet/VZ crash, the macOS
+/// vmnet framework can keep stale state for that slot so every VM assigned to
+/// it crashes the same way. The retry releases the slot, adds its block index
+/// to `exclude`, and re-allocates — getting the *next* free block instead of
+/// the same poisoned one. Callers that don't need poisoning pass
+/// `&HashSet::new()`.
+///
+/// `exclude` is in-memory and supplied per call: poisoning is scoped to the
+/// retry loop within a single `vm start`/`fork` invocation and is not
+/// persisted.
 ///
 /// The full read-modify-write runs under a single `BEGIN IMMEDIATE`
 /// transaction, so parallel allocators serialize at the database layer
@@ -113,47 +190,24 @@ fn block_ips(base: Ipv4Addr, block_index: u32) -> IpAllocation {
 /// key plus the `vm_name UNIQUE` constraint make double-allocation
 /// structurally impossible: even if the `find` logic regressed, a duplicate
 /// `INSERT` would fail with `SQLITE_CONSTRAINT_PRIMARYKEY`.
-pub fn allocate(store: &StateStore, subnet: &str, vm_name: &str) -> Result<IpAllocation> {
-    allocate_excluding(store, subnet, vm_name, &HashSet::new())
-}
-
-/// Allocate the lowest free /30 block, skipping any `exclude`d block indexes.
-///
-/// `exclude` lets the VM-start retry path (SEC-419) route around a "poisoned"
-/// slot: when a VM fails to boot with a transient vmnet/VZ crash, the macOS
-/// vmnet framework can keep stale state for that slot so every VM assigned to
-/// it crashes the same way. The retry releases the slot, adds its block index
-/// to `exclude`, and re-allocates — getting the *next* free block instead of
-/// the same poisoned one.
-///
-/// `exclude` is in-memory and supplied per call: poisoning is scoped to the
-/// retry loop within a single `vm start`/`fork` invocation and is not
-/// persisted. [`allocate`] is the empty-`exclude` special case.
-pub fn allocate_excluding(
+pub fn allocate(
     store: &StateStore,
     subnet: &str,
     vm_name: &str,
     exclude: &HashSet<u32>,
 ) -> Result<IpAllocation> {
     let (base, prefix) = parse_cidr(subnet)?;
+    if prefix > 30 {
+        return Err(Error::Network(format!(
+            "subnet /{prefix} is too small for /30 allocations"
+        )));
+    }
     let max = max_blocks(prefix);
 
     let mut conn = db::open(store.root())?;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
-    // Verify the subnet hasn't changed since allocations started.
-    let existing_subnet: Option<String> = tx
-        .query_row("SELECT subnet FROM network_allocations LIMIT 1", [], |r| {
-            r.get::<_, String>(0)
-        })
-        .ok();
-    if let Some(existing) = existing_subnet {
-        if existing != subnet {
-            return Err(Error::Network(format!(
-                "subnet mismatch: state has '{existing}', requested '{subnet}'"
-            )));
-        }
-    }
+    verify_singleton_subnet(&tx, subnet, STRATEGY_P2P)?;
 
     let used: HashSet<u32> = tx
         .prepare("SELECT block_index FROM network_allocations WHERE subnet = ?1")?
@@ -180,19 +234,105 @@ pub fn allocate_excluding(
         })?;
 
     tx.execute(
-        "INSERT INTO network_allocations (block_index, subnet, vm_name) VALUES (?1, ?2, ?3)",
-        params![block_index, subnet, vm_name],
+        "INSERT INTO network_allocations (block_index, subnet, vm_name, single_address) \
+         VALUES (?1, ?2, ?3, ?4)",
+        params![block_index, subnet, vm_name, STRATEGY_P2P],
     )?;
     tx.commit()?;
 
     Ok(block_ips(base, block_index))
 }
 
-/// Look up the /30 block index currently allocated to `vm_name`, if any.
+/// Allocate a single /32 address for a VM in a shared subnet, skipping any
+/// `exclude`d slots and the addresses in `reserved`.
+///
+/// Used by macOS where vmnet provides a shared L2 bridge — every guest
+/// sits on the same subnet behind one gateway, so a /30 P2P link per
+/// VM (the [`allocate`] strategy) would waste 75% of the address
+/// space. `block_index` here means "address offset from the subnet
+/// base", so a /27 holds 32 candidate slots.
+///
+/// `host_ip` is returned to the caller as-is and conventionally
+/// contains the shared gateway. `reserved` lists addresses the
+/// allocator must never hand out — typically the surrounding /24's
+/// network, broadcast, and gateway when the caller carved a /27 out
+/// of vmnet's /24. `exclude` carries the poisoning set (SEC-419);
+/// callers that don't need poisoning pass `&HashSet::new()`.
+pub fn allocate_single(
+    store: &StateStore,
+    subnet: &str,
+    vm_name: &str,
+    host_ip: &str,
+    netmask: &str,
+    reserved: &[Ipv4Addr],
+    exclude: &HashSet<u32>,
+) -> Result<IpAllocation> {
+    let (base, prefix) = parse_cidr(subnet)?;
+    let max = 1u32 << (32 - prefix);
+    let base_u32 = u32::from(base);
+
+    let mut conn = db::open(store.root())?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+
+    verify_singleton_subnet(&tx, subnet, STRATEGY_SINGLE)?;
+
+    let used: HashSet<u32> = tx
+        .prepare("SELECT block_index FROM network_allocations WHERE subnet = ?1")?
+        .query_map(params![subnet], |r| r.get::<_, u32>(0))?
+        .collect::<std::result::Result<_, _>>()?;
+
+    // Walk the subnet looking for an unallocated, non-reserved, non-excluded
+    // slot. Skipping reserved addresses keeps the gateway (and the wider
+    // /24's network and broadcast when carved into /27s) un-handout-able
+    // without the caller having to seed the table.
+    let block_index = (0..max)
+        .find(|i| {
+            if used.contains(i) || exclude.contains(i) {
+                return false;
+            }
+            let addr = Ipv4Addr::from(base_u32 + i);
+            !reserved.contains(&addr)
+        })
+        .ok_or_else(|| {
+            if exclude.is_empty() {
+                Error::Network(format!(
+                    "no free addresses in {subnet} ({} allocated, {} reserved)",
+                    used.len(),
+                    reserved.len()
+                ))
+            } else {
+                Error::Network(format!(
+                    "no usable addresses in {subnet}: {} allocated, {} reserved, {} poisoned \
+                     (transient VZ start failures) — try 'ember network reset' or reboot",
+                    used.len(),
+                    reserved.len(),
+                    exclude.len()
+                ))
+            }
+        })?;
+
+    tx.execute(
+        "INSERT INTO network_allocations (block_index, subnet, vm_name, single_address) \
+         VALUES (?1, ?2, ?3, ?4)",
+        params![block_index, subnet, vm_name, STRATEGY_SINGLE],
+    )?;
+    tx.commit()?;
+
+    let guest_ip = Ipv4Addr::from(base_u32 + block_index);
+    Ok(IpAllocation {
+        block_index,
+        host_ip: host_ip.to_string(),
+        guest_ip: guest_ip.to_string(),
+        netmask: netmask.to_string(),
+    })
+}
+
+/// Look up the block index currently allocated to `vm_name`, if any.
 ///
 /// Used by the start-retry path (SEC-419) to learn which slot just failed —
 /// it must be added to the poison set *before* the allocation is released,
-/// otherwise the next [`allocate_excluding`] would hand back the same slot.
+/// otherwise the next [`allocate`]/[`allocate_single`] would hand back the
+/// same slot.
 pub fn allocated_block(store: &StateStore, vm_name: &str) -> Result<Option<u32>> {
     let conn = db::open(store.root())?;
     let block: Option<u32> = conn
@@ -215,38 +355,59 @@ pub struct AllocationRow {
     pub vm_name: String,
     pub host_ip: String,
     pub guest_ip: String,
+    /// True if this row was created via [`allocate_single`] (single-address
+    /// macOS path), false for /30 P2P.
+    pub single_address: bool,
 }
 
-/// List every recorded /30 allocation, ordered by subnet then block index.
+/// List every recorded allocation, ordered by subnet then block index.
 ///
 /// Powers `ember network status` (SEC-419): operators can see which slots
 /// are in use and by which VM without reading the state DB directly.
+///
+/// IPs are recomputed from `(subnet, block_index, single_address)`. For
+/// single-address rows the host IP is reported as the subnet base + 1
+/// (a best-effort hint — the actual host IP was supplied by the caller
+/// at allocate time and is not persisted; the rendered value is only
+/// meaningful for operators' situational awareness).
 pub fn list_allocations(store: &StateStore) -> Result<Vec<AllocationRow>> {
     let conn = db::open(store.root())?;
     let mut stmt = conn.prepare(
-        "SELECT block_index, subnet, vm_name FROM network_allocations \
+        "SELECT block_index, subnet, vm_name, single_address FROM network_allocations \
          ORDER BY subnet, block_index",
     )?;
-    let rows = stmt
+    let rows: Vec<(u32, String, String, i64)> = stmt
         .query_map([], |r| {
             Ok((
                 r.get::<_, u32>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
             ))
         })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+        .collect::<std::result::Result<_, _>>()?;
 
     let mut out = Vec::with_capacity(rows.len());
-    for (block_index, subnet, vm_name) in rows {
+    for (block_index, subnet, vm_name, single_address) in rows {
         let (base, _prefix) = parse_cidr(&subnet)?;
-        let ips = block_ips(base, block_index);
+        let (host_ip, guest_ip) = if single_address == STRATEGY_SINGLE {
+            let base_u32 = u32::from(base);
+            // Host IP isn't persisted on single-address rows; report the
+            // subnet base + 1 (the conventional gateway slot) as a hint.
+            let host = Ipv4Addr::from(base_u32 + 1);
+            let guest = Ipv4Addr::from(base_u32 + block_index);
+            (host.to_string(), guest.to_string())
+        } else {
+            let ips = block_ips(base, block_index);
+            (ips.host_ip, ips.guest_ip)
+        };
         out.push(AllocationRow {
             block_index,
             subnet,
             vm_name,
-            host_ip: ips.host_ip,
-            guest_ip: ips.guest_ip,
+            host_ip,
+            guest_ip,
+            single_address: single_address == STRATEGY_SINGLE,
         });
     }
     Ok(out)
@@ -254,8 +415,8 @@ pub fn list_allocations(store: &StateStore) -> Result<Vec<AllocationRow>> {
 
 /// Release a VM's IP allocation.
 ///
-/// Removes all allocation entries for the given VM name, making the /30
-/// block available for reuse. Idempotent — does nothing if the VM has no
+/// Removes all allocation entries for the given VM name, making the slot
+/// available for reuse. Idempotent — does nothing if the VM has no
 /// allocation.
 pub fn release(store: &StateStore, vm_name: &str) -> Result<()> {
     let conn = db::open(store.root())?;
@@ -312,14 +473,6 @@ pub enum AnomalyKind {
 /// `ember vm list` to flag corrupted state — see SEC-459 for the failure
 /// mode this catches (allocator-state-vs-running-VM divergence after a
 /// crash that bypassed the proper allocator path).
-///
-/// Today's checks:
-///   - No two VMs share a `(subnet, block_index)` — the schema already
-///     enforces this; a violation here means the constraint was bypassed.
-///   - No `vm_name` appears more than once across rows.
-///
-/// Both are belt-and-suspenders against a hypothetical schema drift; under
-/// normal operation the SQL constraints catch them at insert time.
 ///
 /// Returns `Err` if the underlying SQLite store can't be opened or queried.
 /// Callers MUST surface this — a swallowed error in a corruption-detection
@@ -390,6 +543,10 @@ pub fn check_invariants(store: &StateStore) -> Result<Vec<Anomaly>> {
 mod tests {
     use super::*;
 
+    fn no_exclude() -> HashSet<u32> {
+        HashSet::new()
+    }
+
     // --- CIDR parsing ---
 
     #[test]
@@ -407,8 +564,15 @@ mod tests {
     }
 
     #[test]
-    fn parse_cidr_rejects_slash_31() {
-        assert!(parse_cidr("10.0.0.0/31").is_err());
+    fn parse_cidr_accepts_up_to_slash_32() {
+        assert!(parse_cidr("10.0.0.0/31").is_ok());
+        assert!(parse_cidr("192.168.64.0/27").is_ok());
+        assert!(parse_cidr("10.0.0.5/32").is_ok());
+    }
+
+    #[test]
+    fn parse_cidr_rejects_slash_above_32() {
+        assert!(parse_cidr("10.0.0.0/33").is_err());
     }
 
     #[test]
@@ -460,7 +624,7 @@ mod tests {
         assert_eq!(alloc.guest_ip, "10.100.1.2");
     }
 
-    // --- Allocate / release with state store ---
+    // --- Allocate / release with state store (P2P strategy) ---
 
     fn test_store() -> (tempfile::TempDir, StateStore) {
         let dir = tempfile::tempdir().unwrap();
@@ -472,7 +636,7 @@ mod tests {
     #[test]
     fn allocate_first_block() {
         let (_dir, store) = test_store();
-        let alloc = allocate(&store, "10.100.0.0/16", "vm1").unwrap();
+        let alloc = allocate(&store, "10.100.0.0/16", "vm1", &no_exclude()).unwrap();
         assert_eq!(alloc.block_index, 0);
         assert_eq!(alloc.host_ip, "10.100.0.1");
         assert_eq!(alloc.guest_ip, "10.100.0.2");
@@ -481,9 +645,9 @@ mod tests {
     #[test]
     fn allocate_sequential() {
         let (_dir, store) = test_store();
-        let a1 = allocate(&store, "10.100.0.0/16", "vm1").unwrap();
-        let a2 = allocate(&store, "10.100.0.0/16", "vm2").unwrap();
-        let a3 = allocate(&store, "10.100.0.0/16", "vm3").unwrap();
+        let a1 = allocate(&store, "10.100.0.0/16", "vm1", &no_exclude()).unwrap();
+        let a2 = allocate(&store, "10.100.0.0/16", "vm2", &no_exclude()).unwrap();
+        let a3 = allocate(&store, "10.100.0.0/16", "vm3", &no_exclude()).unwrap();
 
         assert_eq!(a1.block_index, 0);
         assert_eq!(a2.block_index, 1);
@@ -497,15 +661,13 @@ mod tests {
     #[test]
     fn allocate_reuses_released_block() {
         let (_dir, store) = test_store();
-        allocate(&store, "10.100.0.0/16", "vm1").unwrap();
-        allocate(&store, "10.100.0.0/16", "vm2").unwrap();
-        allocate(&store, "10.100.0.0/16", "vm3").unwrap();
+        allocate(&store, "10.100.0.0/16", "vm1", &no_exclude()).unwrap();
+        allocate(&store, "10.100.0.0/16", "vm2", &no_exclude()).unwrap();
+        allocate(&store, "10.100.0.0/16", "vm3", &no_exclude()).unwrap();
 
-        // Release the middle one.
         release(&store, "vm2").unwrap();
 
-        // Next allocation should reuse block 1.
-        let a4 = allocate(&store, "10.100.0.0/16", "vm4").unwrap();
+        let a4 = allocate(&store, "10.100.0.0/16", "vm4", &no_exclude()).unwrap();
         assert_eq!(a4.block_index, 1);
         assert_eq!(a4.host_ip, "10.100.0.5");
     }
@@ -513,47 +675,43 @@ mod tests {
     #[test]
     fn allocate_exhausts_small_subnet() {
         let (_dir, store) = test_store();
-        allocate(&store, "192.168.1.0/30", "vm1").unwrap();
-        let err = allocate(&store, "192.168.1.0/30", "vm2").unwrap_err();
+        allocate(&store, "192.168.1.0/30", "vm1", &no_exclude()).unwrap();
+        let err = allocate(&store, "192.168.1.0/30", "vm2", &no_exclude()).unwrap_err();
         assert!(err.to_string().contains("no free /30 blocks"));
+    }
+
+    #[test]
+    fn allocate_rejects_too_narrow_subnet() {
+        let (_dir, store) = test_store();
+        let err = allocate(&store, "10.0.0.0/31", "vm1", &no_exclude()).unwrap_err();
+        assert!(matches!(err, Error::Network(_)));
     }
 
     // --- SEC-419: poison-aware allocation + slot lookup ---
 
     #[test]
-    fn allocate_excluding_skips_poisoned_slot() {
+    fn allocate_skips_poisoned_slot() {
         let (_dir, store) = test_store();
-        // Slot 0 is free, but poisoned (its previous VM crashed at boot).
         let poisoned = HashSet::from([0u32]);
-        let alloc = allocate_excluding(&store, "10.100.0.0/16", "vm1", &poisoned).unwrap();
-        // Allocator routes around slot 0 to the next free block.
+        let alloc = allocate(&store, "10.100.0.0/16", "vm1", &poisoned).unwrap();
         assert_eq!(alloc.block_index, 1);
         assert_eq!(alloc.host_ip, "10.100.0.5");
     }
 
     #[test]
-    fn allocate_excluding_skips_multiple_poisoned_slots() {
+    fn allocate_skips_multiple_poisoned_slots() {
         let (_dir, store) = test_store();
         let poisoned = HashSet::from([0u32, 1, 2]);
-        let alloc = allocate_excluding(&store, "10.100.0.0/16", "vm1", &poisoned).unwrap();
+        let alloc = allocate(&store, "10.100.0.0/16", "vm1", &poisoned).unwrap();
         assert_eq!(alloc.block_index, 3);
     }
 
     #[test]
-    fn allocate_excluding_empty_matches_allocate() {
+    fn allocate_all_poisoned_errors_distinctly() {
         let (_dir, store) = test_store();
-        let alloc = allocate_excluding(&store, "10.100.0.0/16", "vm1", &HashSet::new()).unwrap();
-        assert_eq!(alloc.block_index, 0);
-    }
-
-    #[test]
-    fn allocate_excluding_all_poisoned_errors_distinctly() {
-        let (_dir, store) = test_store();
-        // /30 subnet has exactly one block (index 0); poison it.
         let poisoned = HashSet::from([0u32]);
-        let err = allocate_excluding(&store, "192.168.1.0/30", "vm1", &poisoned).unwrap_err();
+        let err = allocate(&store, "192.168.1.0/30", "vm1", &poisoned).unwrap_err();
         let msg = err.to_string();
-        // Distinct from the "subnet full" message — points at poisoning.
         assert!(msg.contains("poisoned"), "got: {msg}");
         assert!(!msg.contains("all 1 blocks allocated"), "got: {msg}");
     }
@@ -561,10 +719,9 @@ mod tests {
     #[test]
     fn allocated_block_reports_then_clears_on_release() {
         let (_dir, store) = test_store();
-        allocate(&store, "10.100.0.0/16", "vm1").unwrap();
-        let a2 = allocate(&store, "10.100.0.0/16", "vm2").unwrap();
+        allocate(&store, "10.100.0.0/16", "vm1", &no_exclude()).unwrap();
+        let a2 = allocate(&store, "10.100.0.0/16", "vm2", &no_exclude()).unwrap();
 
-        // The retry path reads the failed VM's slot before releasing it.
         assert_eq!(
             allocated_block(&store, "vm2").unwrap(),
             Some(a2.block_index)
@@ -578,17 +735,17 @@ mod tests {
     #[test]
     fn list_allocations_reports_rows_with_resolved_ips() {
         let (_dir, store) = test_store();
-        allocate(&store, "10.100.0.0/16", "vm1").unwrap();
-        allocate(&store, "10.100.0.0/16", "vm2").unwrap();
+        allocate(&store, "10.100.0.0/16", "vm1", &no_exclude()).unwrap();
+        allocate(&store, "10.100.0.0/16", "vm2", &no_exclude()).unwrap();
         release(&store, "vm1").unwrap();
 
         let rows = list_allocations(&store).unwrap();
-        // Only vm2 remains; IPs are resolved from its block index.
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].vm_name, "vm2");
         assert_eq!(rows[0].block_index, 1);
         assert_eq!(rows[0].guest_ip, "10.100.0.6");
         assert_eq!(rows[0].host_ip, "10.100.0.5");
+        assert!(!rows[0].single_address);
     }
 
     #[test]
@@ -599,24 +756,18 @@ mod tests {
 
     #[test]
     fn poisoned_slot_release_and_retry_does_not_disturb_healthy_vms() {
-        // SEC-345 rollback-isolation shield: a failed VM's release + retry on
-        // the next slot must leave unrelated healthy allocations untouched.
+        // SEC-345 rollback-isolation shield.
         let (_dir, store) = test_store();
-        let healthy1 = allocate(&store, "10.100.0.0/16", "healthy1").unwrap();
-        let healthy2 = allocate(&store, "10.100.0.0/16", "healthy2").unwrap();
+        let healthy1 = allocate(&store, "10.100.0.0/16", "healthy1", &no_exclude()).unwrap();
+        let healthy2 = allocate(&store, "10.100.0.0/16", "healthy2", &no_exclude()).unwrap();
 
-        // "failing" VM lands on slot 2, "crashes", is released + poisoned.
-        let failed = allocate(&store, "10.100.0.0/16", "failing").unwrap();
+        let failed = allocate(&store, "10.100.0.0/16", "failing", &no_exclude()).unwrap();
         assert_eq!(failed.block_index, 2);
         release(&store, "failing").unwrap();
         let poisoned = HashSet::from([failed.block_index]);
-        let retry = allocate_excluding(&store, "10.100.0.0/16", "failing", &poisoned).unwrap();
-        assert_eq!(
-            retry.block_index, 3,
-            "retry must route around poisoned slot 2"
-        );
+        let retry = allocate(&store, "10.100.0.0/16", "failing", &poisoned).unwrap();
+        assert_eq!(retry.block_index, 3);
 
-        // Healthy VMs keep their original slots throughout.
         assert_eq!(
             allocated_block(&store, "healthy1").unwrap(),
             Some(healthy1.block_index)
@@ -630,19 +781,16 @@ mod tests {
     #[test]
     fn allocate_rejects_subnet_mismatch() {
         let (_dir, store) = test_store();
-        allocate(&store, "10.100.0.0/16", "vm1").unwrap();
-        let err = allocate(&store, "10.200.0.0/16", "vm2").unwrap_err();
+        allocate(&store, "10.100.0.0/16", "vm1", &no_exclude()).unwrap();
+        let err = allocate(&store, "10.200.0.0/16", "vm2", &no_exclude()).unwrap_err();
         assert!(err.to_string().contains("subnet mismatch"));
     }
 
     #[test]
     fn allocate_rejects_duplicate_vm_name() {
-        // The schema's UNIQUE(vm_name) makes double-allocation impossible.
-        // The allocator function shouldn't be called twice for the same VM,
-        // but if it is, surface a clear error rather than silently succeeding.
         let (_dir, store) = test_store();
-        allocate(&store, "10.100.0.0/16", "vm1").unwrap();
-        let err = allocate(&store, "10.100.0.0/16", "vm1").unwrap_err();
+        allocate(&store, "10.100.0.0/16", "vm1", &no_exclude()).unwrap();
+        let err = allocate(&store, "10.100.0.0/16", "vm1", &no_exclude()).unwrap_err();
         assert!(err.to_string().contains("UNIQUE") || err.to_string().contains("sqlite"));
     }
 
@@ -651,7 +799,7 @@ mod tests {
         let (_dir, store) = test_store();
         release(&store, "nonexistent").unwrap();
 
-        allocate(&store, "10.100.0.0/16", "vm1").unwrap();
+        allocate(&store, "10.100.0.0/16", "vm1", &no_exclude()).unwrap();
         release(&store, "vm1").unwrap();
         release(&store, "vm1").unwrap();
     }
@@ -659,9 +807,9 @@ mod tests {
     #[test]
     fn release_only_removes_target_vm() {
         let (_dir, store) = test_store();
-        allocate(&store, "10.100.0.0/16", "vm1").unwrap();
-        allocate(&store, "10.100.0.0/16", "vm2").unwrap();
-        allocate(&store, "10.100.0.0/16", "vm3").unwrap();
+        allocate(&store, "10.100.0.0/16", "vm1", &no_exclude()).unwrap();
+        allocate(&store, "10.100.0.0/16", "vm2", &no_exclude()).unwrap();
+        allocate(&store, "10.100.0.0/16", "vm3", &no_exclude()).unwrap();
 
         release(&store, "vm2").unwrap();
 
@@ -676,23 +824,232 @@ mod tests {
         assert_eq!(rows, vec![(0, "vm1".to_string()), (2, "vm3".to_string())]);
     }
 
+    // --- allocate_single (macOS shared-subnet path) ---
+
+    /// Helper: vmnet's host-global reservations carved out of the /24.
+    fn vmnet_reserved() -> [Ipv4Addr; 3] {
+        [
+            Ipv4Addr::new(192, 168, 64, 0),
+            Ipv4Addr::new(192, 168, 64, 1),
+            Ipv4Addr::new(192, 168, 64, 255),
+        ]
+    }
+
+    #[test]
+    fn allocate_single_skips_network_and_gateway_in_slot_zero() {
+        let (_dir, store) = test_store();
+        let reserved = vmnet_reserved();
+        let alloc = allocate_single(
+            &store,
+            "192.168.64.0/27",
+            "vm1",
+            "192.168.64.1",
+            "255.255.255.0",
+            &reserved,
+            &no_exclude(),
+        )
+        .unwrap();
+        assert_eq!(alloc.guest_ip, "192.168.64.2");
+        assert_eq!(alloc.host_ip, "192.168.64.1");
+        assert_eq!(alloc.netmask, "255.255.255.0");
+        assert_eq!(alloc.block_index, 2);
+    }
+
+    #[test]
+    fn allocate_single_packs_addresses_one_per_vm() {
+        let (_dir, store) = test_store();
+        let reserved = vmnet_reserved();
+        let mut last_octet = None;
+        for i in 0..30 {
+            let alloc = allocate_single(
+                &store,
+                "192.168.64.0/27",
+                &format!("vm{i}"),
+                "192.168.64.1",
+                "255.255.255.0",
+                &reserved,
+                &no_exclude(),
+            )
+            .unwrap();
+            let octet: u8 = alloc.guest_ip.split('.').nth(3).unwrap().parse().unwrap();
+            assert!(octet >= 2);
+            if let Some(prev) = last_octet {
+                assert!(octet > prev, "expected strictly monotonic guest IPs");
+            }
+            last_octet = Some(octet);
+        }
+    }
+
+    #[test]
+    fn allocate_single_skips_broadcast_in_top_slot() {
+        let (_dir, store) = test_store();
+        let reserved = vmnet_reserved();
+        for i in 0..31 {
+            allocate_single(
+                &store,
+                "192.168.64.224/27",
+                &format!("vm{i}"),
+                "192.168.64.1",
+                "255.255.255.0",
+                &reserved,
+                &no_exclude(),
+            )
+            .unwrap();
+        }
+        let err = allocate_single(
+            &store,
+            "192.168.64.224/27",
+            "overflow",
+            "192.168.64.1",
+            "255.255.255.0",
+            &reserved,
+            &no_exclude(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Network(_)));
+    }
+
+    #[test]
+    fn allocate_single_reuses_released_addresses() {
+        let (_dir, store) = test_store();
+        let reserved = vmnet_reserved();
+        let a1 = allocate_single(
+            &store,
+            "192.168.64.32/27",
+            "vm1",
+            "192.168.64.1",
+            "255.255.255.0",
+            &reserved,
+            &no_exclude(),
+        )
+        .unwrap();
+        let a2 = allocate_single(
+            &store,
+            "192.168.64.32/27",
+            "vm2",
+            "192.168.64.1",
+            "255.255.255.0",
+            &reserved,
+            &no_exclude(),
+        )
+        .unwrap();
+        let _a3 = allocate_single(
+            &store,
+            "192.168.64.32/27",
+            "vm3",
+            "192.168.64.1",
+            "255.255.255.0",
+            &reserved,
+            &no_exclude(),
+        )
+        .unwrap();
+        assert_ne!(a1.guest_ip, a2.guest_ip);
+
+        release(&store, "vm2").unwrap();
+
+        let a4 = allocate_single(
+            &store,
+            "192.168.64.32/27",
+            "vm4",
+            "192.168.64.1",
+            "255.255.255.0",
+            &reserved,
+            &no_exclude(),
+        )
+        .unwrap();
+        assert_eq!(a4.guest_ip, a2.guest_ip);
+    }
+
+    #[test]
+    fn allocate_single_rejects_subnet_mismatch_on_reread() {
+        let (_dir, store) = test_store();
+        let reserved = vmnet_reserved();
+        allocate_single(
+            &store,
+            "192.168.64.32/27",
+            "vm1",
+            "192.168.64.1",
+            "255.255.255.0",
+            &reserved,
+            &no_exclude(),
+        )
+        .unwrap();
+        let err = allocate_single(
+            &store,
+            "192.168.64.64/27",
+            "vm2",
+            "192.168.64.1",
+            "255.255.255.0",
+            &reserved,
+            &no_exclude(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Network(msg) if msg.contains("subnet mismatch")));
+    }
+
+    #[test]
+    fn allocate_single_skips_poisoned_slot() {
+        let (_dir, store) = test_store();
+        let reserved = vmnet_reserved();
+        let poisoned = HashSet::from([2u32]);
+        let alloc = allocate_single(
+            &store,
+            "192.168.64.0/27",
+            "vm1",
+            "192.168.64.1",
+            "255.255.255.0",
+            &reserved,
+            &poisoned,
+        )
+        .unwrap();
+        assert_eq!(alloc.guest_ip, "192.168.64.3");
+        assert_eq!(alloc.block_index, 3);
+    }
+
+    #[test]
+    fn list_allocations_resolves_single_address_rows() {
+        let (_dir, store) = test_store();
+        let reserved = vmnet_reserved();
+        allocate_single(
+            &store,
+            "192.168.64.0/27",
+            "vm1",
+            "192.168.64.1",
+            "255.255.255.0",
+            &reserved,
+            &no_exclude(),
+        )
+        .unwrap();
+        let rows = list_allocations(&store).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].vm_name, "vm1");
+        assert_eq!(rows[0].guest_ip, "192.168.64.2");
+        assert!(rows[0].single_address);
+    }
+
+    #[test]
+    fn strategy_mismatch_rejected_on_reread() {
+        let (_dir, store) = test_store();
+        allocate(&store, "10.100.0.0/16", "vm1", &no_exclude()).unwrap();
+        let reserved: [Ipv4Addr; 0] = [];
+        let err = allocate_single(
+            &store,
+            "10.100.0.0/16",
+            "vm2",
+            "10.100.0.1",
+            "255.255.0.0",
+            &reserved,
+            &no_exclude(),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("strategy mismatch"),
+            "got: {err}"
+        );
+    }
+
     // --- Concurrency stress test (SEC-459 regression) ---
 
-    /// Spawn N OS threads, each calling `allocate()` against a shared store
-    /// with a distinct VM name. A `Barrier` makes all threads enter
-    /// `BEGIN IMMEDIATE` near-simultaneously — without it, the threads can
-    /// serialize on scheduler luck and never actually exercise the race
-    /// window. After all threads finish, assert:
-    ///
-    ///   - every call returned `Ok`
-    ///   - every returned `block_index` is unique
-    ///   - the database has exactly N rows
-    ///
-    /// This is the regression test for SEC-459. Before the SQLite migration,
-    /// six parallel `ember vm start` invocations could each see the same
-    /// "free" slot and each return the same block_index — silently — because
-    /// the JSON store's flock was only held for the duration of a single
-    /// read or write call, not the read-modify-write transaction.
     #[test]
     fn parallel_allocate_produces_unique_slots() {
         use std::sync::{Arc, Barrier};
@@ -711,25 +1068,16 @@ mod tests {
             let store = Arc::clone(&store);
             let barrier = Arc::clone(&barrier);
             handles.push(thread::spawn(move || {
-                // Wait until every thread has reached this point, then race
-                // into `allocate()` together. This forces actual contention
-                // on `BEGIN IMMEDIATE` instead of relying on scheduler luck.
                 barrier.wait();
-                allocate(&store, "10.100.0.0/16", &format!("vm{i}")).unwrap()
+                allocate(&store, "10.100.0.0/16", &format!("vm{i}"), &HashSet::new()).unwrap()
             }));
         }
 
         let results: Vec<IpAllocation> = handles.into_iter().map(|h| h.join().unwrap()).collect();
 
-        // Every block_index is distinct.
         let unique_slots: HashSet<u32> = results.iter().map(|a| a.block_index).collect();
-        assert_eq!(
-            unique_slots.len(),
-            N,
-            "parallel allocate produced duplicate slots: {results:?}"
-        );
+        assert_eq!(unique_slots.len(), N);
 
-        // DB has exactly N rows.
         let conn = db::open(store.root()).unwrap();
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM network_allocations", [], |r| r.get(0))
@@ -742,27 +1090,22 @@ mod tests {
     #[test]
     fn check_invariants_clean_store() {
         let (_dir, store) = test_store();
-        allocate(&store, "10.100.0.0/16", "vm1").unwrap();
-        allocate(&store, "10.100.0.0/16", "vm2").unwrap();
+        allocate(&store, "10.100.0.0/16", "vm1", &no_exclude()).unwrap();
+        allocate(&store, "10.100.0.0/16", "vm2", &no_exclude()).unwrap();
         let anomalies = check_invariants(&store).unwrap();
-        assert!(anomalies.is_empty(), "unexpected anomalies: {anomalies:?}");
+        assert!(anomalies.is_empty());
     }
 
-    /// Drop the PRIMARY KEY / UNIQUE constraints on `network_allocations`
-    /// so a test can inject otherwise-impossible duplicate rows. The
-    /// schema's PK + UNIQUE makes the duplicates we want to test for
-    /// structurally impossible — but `check_invariants` is the safety net
-    /// for corrupted state that bypassed those constraints (manual edit,
-    /// migration bug, etc.), so the test has to fake that scenario.
     fn drop_alloc_constraints(store: &StateStore) {
         let conn = db::open(store.root()).unwrap();
         conn.execute_batch(
             "
             BEGIN;
             CREATE TABLE network_allocations_tmp (
-                block_index INTEGER NOT NULL,
-                subnet      TEXT    NOT NULL,
-                vm_name     TEXT    NOT NULL
+                block_index    INTEGER NOT NULL,
+                subnet         TEXT    NOT NULL,
+                vm_name        TEXT    NOT NULL,
+                single_address INTEGER NOT NULL DEFAULT 0
             ) STRICT;
             INSERT INTO network_allocations_tmp
                 SELECT * FROM network_allocations;
@@ -778,8 +1121,8 @@ mod tests {
         drop_alloc_constraints(store);
         let conn = db::open(store.root()).unwrap();
         conn.execute(
-            "INSERT INTO network_allocations (block_index, subnet, vm_name)
-             VALUES (?1, ?2, ?3)",
+            "INSERT INTO network_allocations (block_index, subnet, vm_name, single_address)
+             VALUES (?1, ?2, ?3, 0)",
             params![block_index, subnet, vm_name],
         )
         .unwrap();
@@ -788,10 +1131,7 @@ mod tests {
     #[test]
     fn check_invariants_duplicate_slot_attributes_all_vms() {
         let (_dir, store) = test_store();
-        // Allocate vm1 at slot 0 normally — this also pre-creates the
-        // network_allocations table via the migration path.
-        let alloc1 = allocate(&store, "10.100.0.0/16", "vm1").unwrap();
-        // Now bypass the PK and inject vm2 at the same slot.
+        let alloc1 = allocate(&store, "10.100.0.0/16", "vm1", &no_exclude()).unwrap();
         force_duplicate_slot(&store, "10.100.0.0/16", alloc1.block_index, "vm2");
 
         let anomalies = check_invariants(&store).unwrap();
@@ -799,25 +1139,10 @@ mod tests {
             .iter()
             .filter(|a| matches!(a.kind, AnomalyKind::DuplicateSlot { .. }))
             .collect();
-        assert_eq!(
-            dup_slot.len(),
-            1,
-            "expected exactly one DuplicateSlot anomaly, got: {anomalies:?}"
-        );
+        assert_eq!(dup_slot.len(), 1);
         let a = dup_slot[0];
-        // BOTH vms must be flagged — the prior `Vec<String>` representation
-        // forced callers to scrape one name out of the message and miss the
-        // others. SEC-460 is about closing exactly that gap.
-        assert!(
-            a.vm_names.contains(&"vm1".to_string()),
-            "vm1 missing: {:?}",
-            a.vm_names
-        );
-        assert!(
-            a.vm_names.contains(&"vm2".to_string()),
-            "vm2 missing: {:?}",
-            a.vm_names
-        );
+        assert!(a.vm_names.contains(&"vm1".to_string()));
+        assert!(a.vm_names.contains(&"vm2".to_string()));
         assert_eq!(a.vm_names.len(), 2);
         match &a.kind {
             AnomalyKind::DuplicateSlot {
@@ -836,15 +1161,12 @@ mod tests {
     #[test]
     fn check_invariants_duplicate_vm_name_lists_one_vm() {
         let (_dir, store) = test_store();
-        allocate(&store, "10.100.0.0/16", "vm1").unwrap();
-        // Insert a second row for the same vm_name at a different slot.
-        // The UNIQUE(vm_name) constraint makes this impossible via the
-        // public API; we bypass it the same way as the slot test.
+        allocate(&store, "10.100.0.0/16", "vm1", &no_exclude()).unwrap();
         drop_alloc_constraints(&store);
         let conn = db::open(store.root()).unwrap();
         conn.execute(
-            "INSERT INTO network_allocations (block_index, subnet, vm_name)
-             VALUES (1, '10.100.0.0/16', 'vm1')",
+            "INSERT INTO network_allocations (block_index, subnet, vm_name, single_address)
+             VALUES (1, '10.100.0.0/16', 'vm1', 0)",
             [],
         )
         .unwrap();
@@ -854,11 +1176,7 @@ mod tests {
             .iter()
             .filter(|a| matches!(a.kind, AnomalyKind::DuplicateVmName { .. }))
             .collect();
-        assert_eq!(
-            dup_name.len(),
-            1,
-            "expected exactly one DuplicateVmName anomaly, got: {anomalies:?}"
-        );
+        assert_eq!(dup_name.len(), 1);
         let a = dup_name[0];
         assert_eq!(a.vm_names, vec!["vm1".to_string()]);
         match &a.kind {
@@ -872,21 +1190,11 @@ mod tests {
 
     #[test]
     fn check_invariants_propagates_db_open_failure() {
-        // SEC-460: don't let DB-open errors silently report "no anomalies".
-        // Point the store at a path that can't be opened (a regular file
-        // exists where the DB directory should be) — db::open should fail.
         let dir = tempfile::tempdir().unwrap();
         let blocking_file = dir.path().join("state");
         std::fs::write(&blocking_file, b"not a directory").unwrap();
-        // StateStore::new(dir.path()/"state") would expect a directory; we
-        // wrote a file there, which the underlying open path will error on.
         let store = StateStore::new(blocking_file);
-        // init may or may not error depending on platform; we just want
-        // check_invariants itself to NOT silently return Ok([]).
         let result = check_invariants(&store);
-        assert!(
-            result.is_err(),
-            "expected check_invariants to surface DB open failure, got: {result:?}"
-        );
+        assert!(result.is_err());
     }
 }

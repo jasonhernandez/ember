@@ -38,12 +38,24 @@ impl NetworkBackend for LinuxNetwork {
             None => network::wan::detect()?,
         };
 
-        // Allocate a /30 IP block for this VM.
-        let subnet = vm.subnet.as_deref().unwrap_or(network::ip::DEFAULT_SUBNET);
-        let allocation = network::ip::allocate(&self.store, subnet, &vm.name)?;
+        // Allocate a /30 IP block for this VM. The VM-level override
+        // (`vm.subnet`) wins; otherwise inherit the per-installation
+        // default that `ember init` derived from the instance id.
+        let subnet = vm.subnet.as_deref().unwrap_or(&config.ip_subnet);
+        // Linux backend doesn't drive the SEC-419 poison-retry loop today
+        // (transient VZ crashes are a macOS thing); pass an empty exclude.
+        let allocation = network::ip::allocate(
+            &self.store,
+            subnet,
+            &vm.name,
+            &std::collections::HashSet::new(),
+        )?;
 
-        // Create TAP device.
-        let tap_name = network::tap::device_name(&vm.id);
+        // Each network subsystem owns its own name derivation; we
+        // hand them the install's namespace and let them produce the
+        // strings (legacy fallbacks included).
+        let ns = config.instance_namespace();
+        let tap_name = network::tap::device_name(&network::tap::prefix(ns), &vm.id);
         let host_ip_cidr = format!("{}/30", allocation.host_ip);
         if let Err(e) = network::tap::create(&tap_name, &host_ip_cidr) {
             // Clean up IP allocation on failure.
@@ -58,8 +70,12 @@ impl NetworkBackend for LinuxNetwork {
             return Err(e);
         }
 
-        // Add iptables NAT/forwarding rules.
-        if let Err(e) = network::nat::add_rules(&tap_name, &allocation.guest_ip, &wan_iface) {
+        // Add iptables NAT/forwarding rules tagged with this install's
+        // comment so cleanup can scope to *this* installation.
+        let comment = network::nat::comment(ns);
+        if let Err(e) =
+            network::nat::add_rules(&tap_name, &allocation.guest_ip, &wan_iface, &comment)
+        {
             let _ = network::tap::delete(&tap_name);
             let _ = network::ip::release(&self.store, &vm.name);
             return Err(e);
@@ -79,9 +95,9 @@ impl NetworkBackend for LinuxNetwork {
     ///
     /// Best-effort cleanup — continues even if individual steps fail, since
     /// this is called during stop/delete where partial cleanup is acceptable.
-    fn teardown(&self, vm: &VmMetadata) -> Result<()> {
+    fn teardown(&self, vm: &VmMetadata, config: &GlobalConfig) -> Result<()> {
         if let Some(ref net_info) = vm.network {
-            network::cleanup(&self.store, &vm.name, net_info);
+            network::cleanup(&self.store, config, &vm.name, net_info);
         }
         Ok(())
     }
