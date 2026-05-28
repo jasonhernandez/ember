@@ -12,8 +12,9 @@
 
 use std::io::{BufRead, BufReader};
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
+use std::path::Path;
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nix::libc;
 
@@ -35,6 +36,19 @@ const BASE_BOOT_ARGS: &str = "console=hvc0 root=/dev/vda rw";
 /// AVF boot is typically fast (a few seconds), but allow headroom for
 /// slow disks or large kernels.
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Deadline for ember-vz's first stderr heartbeat after spawn (SEC-593).
+///
+/// SEC-445 added an unbuffered `ember-vz: starting (...)` line as the very
+/// first action in `Start.run()`, so a healthy helper emits within ms. If
+/// nothing lands in this window the helper is wedged at init — kill it and
+/// let the SEC-419 retry try the next slot instead of burning the full
+/// `READY_TIMEOUT`. Bounds worst-case start latency from ~90s (3×30s) to
+/// ~3×500ms + one successful 30s wait.
+const HEARTBEAT_DEADLINE: Duration = Duration::from_millis(500);
+
+/// Polling interval for [`wait_for_first_log_line`].
+const HEARTBEAT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Name of the Swift helper binary.
 const EMBER_VZ_BIN: &str = "ember-vz";
@@ -171,6 +185,33 @@ impl VmBackend for MacosVm {
         // Close the write end in the parent — only the child writes to it.
         drop(write_file);
 
+        // Heartbeat-deadline check (SEC-593). ember-vz emits an unbuffered
+        // `ember-vz: starting (...)` line as the first action in Start.run()
+        // (SEC-445), so a healthy helper writes within milliseconds. If
+        // nothing lands in HEARTBEAT_DEADLINE, the helper is wedged at init —
+        // SIGKILL it and surface a transient-VZ error so the SEC-419 retry
+        // immediately tries the next slot instead of waiting the full
+        // READY_TIMEOUT. A healthy-but-slow helper still gets the full 30s
+        // ceiling below; this only short-circuits the "emits nothing" case.
+        let ember_vz_log = vm_dir.join("ember-vz.log");
+        if let Err(e) = wait_for_first_log_line(&ember_vz_log, HEARTBEAT_DEADLINE) {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid as i32),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+
+            let preserved = preserve_ember_vz_log(&config.state_dir, &vm.name, &ember_vz_log);
+            let stderr_tail = read_last_lines(&ember_vz_log, 10);
+
+            // Wrap `e` (an Error::Vm) in EmberVzStartFailed so the SEC-419
+            // retry loop picks it up via is_transient_vz_start().
+            return Err(Error::EmberVzStartFailed {
+                source: Box::new(e),
+                stderr_tail,
+                preserved_log_path: preserved,
+            });
+        }
+
         // Read the MAC address from the ready-fd pipe.
         // ember-vz writes "<MAC>\n" once the VM has booted.
         let mac = match read_mac_from_ready_fd(read_file, READY_TIMEOUT) {
@@ -187,7 +228,6 @@ impl VmBackend for MacosVm {
                 // still pattern-match on its variant (e.g. retry on timeout
                 // but not on CommandExec). Display renders the same multi-line
                 // diagnostic the SEC-466 path produced. SEC-469.
-                let ember_vz_log = vm_dir.join("ember-vz.log");
                 let preserved = preserve_ember_vz_log(&config.state_dir, &vm.name, &ember_vz_log);
                 let stderr_tail = read_last_lines(&ember_vz_log, 10);
 
@@ -455,6 +495,43 @@ fn read_mac_from_ready_fd(read_file: std::fs::File, timeout: Duration) -> Result
     Ok(mac)
 }
 
+/// Poll `path` until it contains at least one byte, or `timeout` elapses.
+///
+/// Used as an early-deadline heartbeat check on `ember-vz` (SEC-593):
+/// SEC-445 made the helper emit an unbuffered `ember-vz: starting (...)`
+/// line as the very first action in `Start.run()`, so any non-empty
+/// content within a few hundred ms confirms the child reached user code.
+/// Nothing in time means the helper is wedged at init and the caller
+/// should kill it rather than burn the full `READY_TIMEOUT`.
+///
+/// Platform-agnostic and pure: no `ember-vz` or VZ dependency, only the
+/// filesystem and a sleep loop. This is what makes it unit-testable on
+/// Linux where `ember-macos` otherwise cannot run.
+///
+/// Returns `Error::Vm` on miss so callers can wrap it in
+/// `EmberVzStartFailed` and have it match `is_transient_vz_start()`
+/// (SEC-419).
+fn wait_for_first_log_line(path: &Path, timeout: Duration) -> Result<()> {
+    let start = Instant::now();
+    loop {
+        // Treat a missing file the same as an empty one: the caller created
+        // the log just before spawn, but on the unlikely path where it's
+        // absent the right answer is still "no heartbeat yet, keep waiting".
+        if let Ok(meta) = std::fs::metadata(path) {
+            if meta.len() > 0 {
+                return Ok(());
+            }
+        }
+        if start.elapsed() >= timeout {
+            return Err(Error::Vm(format!(
+                "ember-vz emitted no heartbeat within {} ms (helper wedged at init)",
+                timeout.as_millis()
+            )));
+        }
+        std::thread::sleep(HEARTBEAT_POLL_INTERVAL);
+    }
+}
+
 /// Read the last `n` lines from a file.
 ///
 /// Returns an empty vec if the file cannot be read (e.g. the log was not
@@ -616,6 +693,114 @@ mod tests {
         // Both files exist.
         assert!(d1.exists());
         assert!(d2.exists());
+    }
+
+    // --- wait_for_first_log_line (SEC-593) ---
+
+    #[test]
+    fn wait_for_first_log_line_ok_when_content_already_present() {
+        // Pre-existing non-empty file: should return Ok immediately on the
+        // first poll without sleeping for the whole timeout.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ember-vz.log");
+        std::fs::write(&path, "ember-vz: starting (...)\n").unwrap();
+
+        let start = Instant::now();
+        wait_for_first_log_line(&path, Duration::from_secs(5)).unwrap();
+        assert!(
+            start.elapsed() < Duration::from_millis(200),
+            "expected fast return on pre-populated log, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn wait_for_first_log_line_ok_when_content_arrives_in_time() {
+        // File starts empty (like the create() at line 140 before ember-vz
+        // writes anything); a background thread writes within the deadline.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ember-vz.log");
+        std::fs::File::create(&path).unwrap();
+
+        let writer_path = path.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(80));
+            std::fs::write(&writer_path, "ember-vz: starting\n").unwrap();
+        });
+
+        wait_for_first_log_line(&path, Duration::from_millis(500)).unwrap();
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn wait_for_first_log_line_err_when_nothing_arrives() {
+        // Empty file, no writer — must time out and return an Error::Vm so
+        // the caller can wrap it into EmberVzStartFailed and have
+        // is_transient_vz_start() match (SEC-419 retry path).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ember-vz.log");
+        std::fs::File::create(&path).unwrap();
+
+        let timeout = Duration::from_millis(80);
+        let start = Instant::now();
+        let err = wait_for_first_log_line(&path, timeout).unwrap_err();
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(err, Error::Vm(_)),
+            "expected Error::Vm, got {err:?}"
+        );
+        assert!(
+            elapsed >= timeout,
+            "should have waited at least the timeout, elapsed {elapsed:?}"
+        );
+        // Slack for scheduler jitter; if this fails the loop is sleeping for
+        // way too long after the deadline.
+        assert!(
+            elapsed < timeout + Duration::from_millis(150),
+            "should have returned soon after timeout, elapsed {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn wait_for_first_log_line_err_when_path_absent() {
+        // Path never created (helper crashed before stderr was redirected,
+        // or the create() racing the spawn). The helper must still time out
+        // cleanly with Error::Vm rather than erroring out earlier on metadata.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.log");
+
+        let err = wait_for_first_log_line(&path, Duration::from_millis(50)).unwrap_err();
+        assert!(matches!(err, Error::Vm(_)));
+    }
+
+    #[test]
+    fn wait_for_first_log_line_accepts_partial_line_without_newline() {
+        // The heartbeat is fputs without buffering, but defend against a
+        // helper that gets paused mid-write: a single byte is still proof of
+        // life. Don't gate Ok on seeing a newline.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ember-vz.log");
+        std::fs::write(&path, "e").unwrap();
+
+        wait_for_first_log_line(&path, Duration::from_millis(200)).unwrap();
+    }
+
+    #[test]
+    fn wait_for_first_log_line_miss_classified_as_transient_vz_start() {
+        // The whole point of returning Error::Vm: when callers wrap it in
+        // EmberVzStartFailed, the SEC-419 retry loop must pick it up.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ember-vz.log");
+        std::fs::File::create(&path).unwrap();
+
+        let inner = wait_for_first_log_line(&path, Duration::from_millis(40)).unwrap_err();
+        let wrapped = Error::EmberVzStartFailed {
+            source: Box::new(inner),
+            stderr_tail: vec![],
+            preserved_log_path: None,
+        };
+        assert!(wrapped.is_transient_vz_start());
     }
 
     #[test]
