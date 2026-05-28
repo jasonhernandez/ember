@@ -124,6 +124,22 @@ impl NetworkBackend for MacosNetwork {
         config: &GlobalConfig,
         exclude: &std::collections::HashSet<u32>,
     ) -> Result<NetworkInfo> {
+        // SEC-263: per-VM egress allow-lists are Linux-only. macOS uses
+        // vmnet's internal NAT, and the pf-based enforcement path is
+        // deferred to a follow-up. Surface the gap loudly here so the
+        // user knows their policy isn't being applied, rather than
+        // silently dropping it on the floor.
+        if let Some(ref policy) = vm.egress {
+            if !policy.is_empty() {
+                eprintln!(
+                    "warning: per-VM egress policy not supported on macOS; \
+                     ignoring egress.allow entries for '{}' \
+                     (pf-based enforcement is a follow-up; SEC-263)",
+                    vm.name
+                );
+            }
+        }
+
         let allocation = match config.instance_namespace() {
             None => {
                 // Per-VM `vm.subnet` overrides the install default; keeps

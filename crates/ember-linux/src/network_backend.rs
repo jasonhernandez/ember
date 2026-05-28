@@ -81,6 +81,33 @@ impl NetworkBackend for LinuxNetwork {
             return Err(e);
         }
 
+        // SEC-263: apply per-VM egress allow-list rules if the VM has
+        // a policy on its metadata. Generation is pure and unit-tested;
+        // failure here unwinds the NAT rules so we don't leak state.
+        if let Some(ref policy) = vm.egress {
+            if !policy.is_empty() {
+                let resolver = network::egress::SystemResolver;
+                let rules = network::egress::generate_rules(
+                    policy,
+                    &allocation.guest_ip,
+                    &wan_iface,
+                    &comment,
+                    &resolver,
+                );
+                if let Err(e) = network::egress::apply_rules(&rules) {
+                    let _ = network::nat::remove_rules(
+                        &tap_name,
+                        &allocation.guest_ip,
+                        &wan_iface,
+                        &comment,
+                    );
+                    let _ = network::tap::delete(&tap_name);
+                    let _ = network::ip::release(&self.store, &vm.name);
+                    return Err(e);
+                }
+            }
+        }
+
         Ok(NetworkInfo {
             tap_device: tap_name,
             host_ip: allocation.host_ip,
@@ -96,8 +123,8 @@ impl NetworkBackend for LinuxNetwork {
     /// Best-effort cleanup — continues even if individual steps fail, since
     /// this is called during stop/delete where partial cleanup is acceptable.
     fn teardown(&self, vm: &VmMetadata, config: &GlobalConfig) -> Result<()> {
-        if let Some(ref net_info) = vm.network {
-            network::cleanup(&self.store, config, &vm.name, net_info);
+        if vm.network.is_some() {
+            network::cleanup(&self.store, config, vm);
         }
         Ok(())
     }

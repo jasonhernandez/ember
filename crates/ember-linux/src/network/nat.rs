@@ -178,7 +178,10 @@ pub fn enable_ip_forwarding() -> Result<()> {
 }
 
 /// Run an iptables command, returning an error on failure.
-fn iptables(args: &[&str]) -> Result<()> {
+///
+/// Exposed within the crate so the egress module can drive
+/// pre-generated rules without re-implementing process wiring.
+pub(crate) fn iptables(args: &[&str]) -> Result<()> {
     let output = Command::new("iptables")
         .args(args)
         .output()
@@ -197,7 +200,7 @@ fn iptables(args: &[&str]) -> Result<()> {
 /// same IP), we need to loop until all copies are gone.
 ///
 /// Silently ignores "rule doesn't exist" errors for idempotent cleanup.
-fn iptables_delete(args: &[&str]) -> Result<()> {
+pub(crate) fn iptables_delete(args: &[&str]) -> Result<()> {
     loop {
         let output =
             Command::new("iptables")
