@@ -34,9 +34,15 @@ use crate::error::Result;
 /// "constraints catch corruption" property robust.
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS network_allocations (
-    block_index INTEGER NOT NULL,
-    subnet      TEXT    NOT NULL,
-    vm_name     TEXT    NOT NULL UNIQUE,
+    block_index    INTEGER NOT NULL,
+    subnet         TEXT    NOT NULL,
+    vm_name        TEXT    NOT NULL UNIQUE,
+    -- 0 = /30 P2P (block_index counts /30 blocks; IPs computed via block_ips).
+    -- 1 = single-address (block_index is the offset within the subnet; the
+    -- guest IP is base + block_index, host IP is supplied by the caller).
+    -- An installation uses exactly one strategy across its lifetime; mixing
+    -- is rejected at allocate-time by the subnet-mismatch check.
+    single_address INTEGER NOT NULL DEFAULT 0 CHECK (single_address IN (0, 1)),
     PRIMARY KEY (subnet, block_index)
 ) STRICT;
 

@@ -125,7 +125,7 @@ pub struct VmMetadata {
     #[serde(default)]
     pub boot_args: Option<String>,
     /// Network subnet for IP allocation (e.g., "10.100.0.0/16").
-    /// Defaults to [`network::ip::DEFAULT_SUBNET`] when not set.
+    /// Defaults to [`crate::config::GlobalConfig::ip_subnet`] when not set.
     #[serde(default)]
     pub subnet: Option<String>,
     /// Network configuration, if networking is set up.
@@ -151,6 +151,10 @@ pub struct VmMetadata {
     /// Vsock configuration, if vsock is enabled for this VM.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vsock: Option<VsockInfo>,
+    /// dm-thin volume id. `None` for ZFS/APFS backends, which encode
+    /// volume identity in [`disk_path`](Self::disk_path) instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thin_id: Option<u64>,
 }
 
 impl VmMetadata {
@@ -182,6 +186,7 @@ impl VmMetadata {
             },
             parent_vm: None,
             vsock: None,
+            thin_id: None,
         }
     }
 }
@@ -311,16 +316,21 @@ pub fn delete(store: &StateStore, name: &str) -> Result<()> {
     store.remove_dir(&dir)
 }
 
+/// Current UTC time as Unix epoch seconds.
+pub fn now_epoch_secs() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 /// Current UTC time as an ISO 8601 string (second precision).
 ///
 /// Format: `YYYY-MM-DDTHH:MM:SSZ` (always UTC).
 pub fn now_iso8601() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let secs = now_epoch_secs();
 
     // Break epoch seconds into date/time components.
     let days = secs / 86400;
@@ -375,6 +385,7 @@ mod tests {
             ssh: SshConfig::default(),
             parent_vm: None,
             vsock: None,
+            thin_id: None,
         }
     }
 

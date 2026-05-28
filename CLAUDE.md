@@ -6,21 +6,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A lightweight CLI for managing microVMs with copy-on-write storage. CLI-only — no daemon, no REST API.
 
-- **Linux**: Firecracker (KVM) + ZFS zvols. See SPEC.md for the full design, TODO.md for the task list.
-- **macOS**: Apple Virtualization Framework + APFS clones. See MACOS-SPEC.md for the design, MACOS-TODO.md for the task list.
-
-## Current Focus
-
-macOS support. Work through MACOS-TODO.md one task at a time. Implement, verify, check off the task, commit, stop.
-
-## Approach
-
-- Follow the design in MACOS-SPEC.md closely for macOS work, SPEC.md for Linux work.
-- Platform-specific code lives behind backend traits (`VmBackend`, `StorageBackend`, `NetworkBackend`) with `#[cfg(target_os)]` compile-time selection.
-- Shell out to platform tools (same philosophy as Linux): `ember-vz` (Swift helper for AVF), `hdiutil`, `diskutil`, `cp -c`, Homebrew `e2fsprogs`.
-- When exploring for design or debugging, start producing actionable output (plans, hypotheses, code) early. Don't spend the whole session just reading code.
-- Deliver complete implementations — do not silently cut scope, leave mocks in place of real logic, or substitute hardcoded data where dynamic generation or fetching is feasible. If a reference implementation solves a problem properly (e.g. generating data from a live source), the spec and implementation should do the same rather than settling for a static shortcut. When a full solution seems impractical, say so explicitly, explain the constraints, and workshop an alternative approach with the user rather than unilaterally downgrading the design.
-- Work through the TODO one task at a time. Implement, verify, check off the task, commit, stop.
+- **Linux**: Firecracker (KVM) + one of:
+  - ZFS zvols (default; see `docs/SPEC.md`).
+  - dm-thin (kernel-builtin device-mapper thin provisioning; see `docs/DM-THIN-SPEC.md`).
+  Backend is selected at `ember init --storage <zfs|dm-thin>` and persisted on `GlobalConfig`.
+- **macOS**: Apple Virtualization Framework + APFS clones. See `docs/MACOS-SPEC.md` for the design.
 
 ## Build Commands
 
@@ -50,52 +40,46 @@ cargo clippy
 # Unit tests
 cargo test
 
-# Manual testing (requires root, ZFS, and firecracker installed)
+# Manual testing (requires root, firecracker, and a backend)
+
+# ZFS backend
 sudo ./target/debug/ember init --pool testpool --device /dev/loop0
 sudo ./target/debug/ember image pull alpine:latest
 sudo ./target/debug/ember vm create testvm --image alpine:latest
+
+# dm-thin backend (no kernel module; in-tree)
+sudo ./target/debug/ember init \
+    --storage dm-thin \
+    --storage-path /var/lib/ember/dm-thin \
+    --size 50G
+sudo ./target/debug/ember image pull alpine:latest
+sudo ./target/debug/ember vm create testvm --image alpine:latest
+
+# Tear down a backend
+sudo ./target/debug/ember deinit --purge
+
+# Grow the dm-thin data device
+sudo ./target/debug/ember storage grow --size 100G
+
+# Integration tests for dm-thin (root + dm-thin module + thin-provisioning-tools)
+sudo cargo test --test dm_thin -- --ignored --test-threads=1
 ```
-
-## Rust Compilation
-
-- Always run `cargo fmt` and `cargo build` after making edits before reporting success.
-- When refactoring function signatures or types, grep for all call sites and update them in the same pass.
-- Check visibility (`pub`) before accessing fields/methods from other modules.
 
 ## Coding Style & Conventions
 
-- Idiomatic Rust: Result/Option, pattern matching, iterators, traits.
-- `snake_case` for functions/variables, `PascalCase` for types, `SCREAMING_SNAKE_CASE` for constants.
-- Use `thiserror` for library-style errors, `anyhow` for application-level error propagation.
 - Prefer explicit error handling. Use `?` for propagation, not `.unwrap()`.
 - Shell out to platform CLI tools — no fragile C library bindings. Linux: `zfs`/`zpool`/`iptables`. macOS: `hdiutil`/`diskutil`/`cp -c`/`ember-vz`.
-
-## Debugging & Refactoring Approach
-
-- When debugging build or test failures, start by reproducing the exact failing command locally and reading its output. Do not run generic checks in a shotgun approach.
-- Run `cargo build` after each logical unit of change. Fix all compilation errors before editing the next file.
-- If stuck after 3-4 investigation steps without progress, stop and summarize what you've tried and found, then ask for direction.
+- Value clear interfaces, boundaries, and abstractions; avoid leaks between them. Subsystems own their own formats — dm-thin owns its pool/volume names, networking owns its TAP prefix and iptables comment, and so on. Shared types like `GlobalConfig` expose generic identity (e.g. `instance_namespace()`) and stay free of subsystem trivia. If you find yourself reaching across a boundary to format a name, match a string, or branch on another subsystem's mode, that's the cue to move the logic to the side that owns the concept.
 
 ## Architecture
 
-See SPEC.md (Linux) and MACOS-SPEC.md (macOS) for full architecture. Key modules:
+See specs in the docs/ folder for details, when needed.
 
-```
-src/
-├── main.rs              # Entry point, CLI dispatch
-├── cli/                 # Command implementations (shared across platforms)
-├── backend/
-│   ├── mod.rs           # Backend trait definitions + #[cfg] re-exports
-│   ├── linux/           # Firecracker + ZFS + TAP + iptables
-│   └── macos/           # AVF (ember-vz) + APFS clones + vmnet
-├── zfs/                 # ZFS pool, dataset, volume, snapshot operations (Linux)
-├── firecracker/         # API client, process management, config builder (Linux)
-├── network/             # TAP devices, IP allocation, NAT rules (Linux)
-├── image/               # OCI pull, ext4 creation, image registry (shared)
-├── ssh/                 # SSH client, exec, file copy (shared, cross-platform)
-├── state/               # JSON state store with file locking (shared)
-└── config/              # YAML config parsing and merge (shared)
-```
+Basic architecture choices:
+
+- Platform-specific code lives behind backend traits (`VmBackend`, `StorageBackend`, `NetworkBackend`).
+- `Vm` and `Network` are picked at compile time via `#[cfg(target_os)]`. `Storage` is a runtime trait object (`Arc<dyn StorageBackend>`) so the concrete backend can be selected from `GlobalConfig.storage_backend` without a rebuild.
+- Shell out to platform tools: `ember-vz` (Swift helper for AVF), `hdiutil`, `diskutil`, `cp -c`, Homebrew `e2fsprogs` on macOS; `zfs`/`zpool`/`iptables`/`dmsetup`/`losetup`/`thin-provisioning-tools` on Linux.
 
 ## Version Control
 

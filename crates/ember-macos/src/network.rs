@@ -19,11 +19,61 @@ pub const VMNET_GATEWAY: &str = "192.168.64.1";
 /// Default netmask for vmnet shared mode (/24).
 pub const VMNET_NETMASK: &str = "255.255.255.0";
 
-/// vmnet shared mode subnet for IP allocation.
+/// Host-wide vmnet shared-mode subnet. Apple's `VZNATNetworkDevice`
+/// owns this /24 and there's no public API to ask for a different
+/// one, so per-installation isolation can only sub-allocate inside
+/// it; see [`derive_vmnet_subnet`].
 ///
-/// Uses /30 blocks via the shared `network::ip` allocator, giving 64
-/// concurrent VMs. The gateway (.1) is always vmnet's built-in router.
-const VMNET_SUBNET: &str = "192.168.64.0/24";
+/// Used directly only as the legacy fallback for configs that
+/// predate `instance_id` — new installs read
+/// [`GlobalConfig::ip_subnet`](ember_core::config::GlobalConfig::ip_subnet)
+/// (a /27 slice) instead.
+pub const VMNET_SUBNET: &str = "192.168.64.0/24";
+
+/// vmnet-owned addresses that no guest may receive, regardless of
+/// which /27 slot an install lands in: the surrounding /24's network
+/// (.0) and broadcast (.255), plus vmnet's built-in router (.1).
+/// Addresses outside the install's /27 slot are still listed; the
+/// allocator just ignores reservations outside the subnet it's
+/// walking, so this single list covers slots 0, 7, and the middle
+/// six identically.
+const VMNET_RESERVED: [std::net::Ipv4Addr; 3] = [
+    std::net::Ipv4Addr::new(192, 168, 64, 0),
+    std::net::Ipv4Addr::new(192, 168, 64, 1),
+    std::net::Ipv4Addr::new(192, 168, 64, 255),
+];
+
+/// Derive a per-installation /27 sub-range inside [`VMNET_SUBNET`].
+///
+/// vmnet's shared subnet is fixed by the framework, so isolation has
+/// to come from carving up the /24 rather than picking a different
+/// one. We split it into 8 /27 slots (32 addresses each) and pick by
+/// the low 3 bits of the instance id parsed as hex. The collision
+/// probability between two installs is 1/8 per pair — acceptable for
+/// personal use, with `--ip-subnet` as the escape hatch when it
+/// bites.
+///
+/// Pairs with [`network::ip::allocate_single`](ember_core::network::ip::allocate_single):
+/// each /27 slot holds 30–32 single-IP allocations after subtracting
+/// vmnet's reserved network/gateway/broadcast addresses, well above
+/// any realistic personal workflow.
+pub fn derive_vmnet_subnet(instance_id: &str) -> String {
+    // Only called from `MacosPlatform::default_ip_subnet` at
+    // `ember init`, where `instance_id` is either CLI-validated
+    // (`parse_instance_id` enforces 4 lowercase hex) or auto-derived
+    // (`derive_instance_id` always emits 4 hex chars). A non-hex id
+    // means upstream validation broke — panic so the bug is loud
+    // rather than silently colliding two installs on slot 0.
+    let id_int = u16::from_str_radix(instance_id, 16).unwrap_or_else(|_| {
+        panic!(
+            "derive_vmnet_subnet got non-hex instance_id {instance_id:?} — \
+                CLI validation should have rejected this"
+        )
+    });
+    let slot = (id_int & 0b111) as u8;
+    let base = slot * 32;
+    format!("192.168.64.{base}/27")
+}
 
 /// macOS network backend using vmnet (shared mode).
 ///
@@ -44,24 +94,56 @@ impl NetworkBackend for MacosNetwork {
     ///
     /// The IP is passed to the kernel via boot args (`ip=<guest>::...`)
     /// so the guest has connectivity immediately at boot — no DHCP needed.
+    ///
+    /// Two allocation strategies, picked by whether the config has an
+    /// `instance_id`:
+    ///
+    /// * Legacy (no instance id): [`network::ip::allocate`] against the
+    ///   full /24, matching what pre-instance-id binaries wrote so an
+    ///   upgrade doesn't reinterpret existing block indices. Caps at
+    ///   ~64 VMs (one /30 per VM).
+    /// * New install: [`network::ip::allocate_single`] against the
+    ///   per-installation /27 slice (see [`derive_vmnet_subnet`]). Gives
+    ///   ~30 VMs per slot — vmnet's shared L2 bridge means the /30 P2P
+    ///   link Linux needs is overkill here and would waste 75% of the
+    ///   address space.
     fn setup(&self, vm: &VmMetadata, config: &GlobalConfig) -> Result<NetworkInfo> {
         self.setup_excluding(vm, config, &std::collections::HashSet::new())
     }
 
     /// Allocate a static guest IP, skipping poisoned vmnet slots (SEC-419).
     ///
-    /// On retry after a transient VZ boot crash, `exclude` carries the /30
-    /// block indexes whose VMs just failed to start; the allocator hands out
-    /// the next free block so we don't re-use a slot the vmnet framework is
-    /// still holding stale state for.
+    /// On retry after a transient VZ boot crash, `exclude` carries the
+    /// block indexes whose VMs just failed to start; the allocator hands
+    /// out the next free slot so we don't re-use one the vmnet framework
+    /// is still holding stale state for. The choice between /30 P2P and
+    /// single-address packing is the same as [`setup`].
     fn setup_excluding(
         &self,
         vm: &VmMetadata,
-        _config: &GlobalConfig,
+        config: &GlobalConfig,
         exclude: &std::collections::HashSet<u32>,
     ) -> Result<NetworkInfo> {
-        let allocation =
-            network::ip::allocate_excluding(&self.store, VMNET_SUBNET, &vm.name, exclude)?;
+        let allocation = match config.instance_namespace() {
+            None => {
+                // Per-VM `vm.subnet` overrides the install default; keeps
+                // parity with pre-instance-id behavior.
+                let subnet = vm.subnet.as_deref().unwrap_or(VMNET_SUBNET);
+                network::ip::allocate(&self.store, subnet, &vm.name, exclude)?
+            }
+            Some(_) => {
+                let subnet = vm.subnet.as_deref().unwrap_or(config.ip_subnet.as_str());
+                network::ip::allocate_single(
+                    &self.store,
+                    subnet,
+                    &vm.name,
+                    VMNET_GATEWAY,
+                    VMNET_NETMASK,
+                    &VMNET_RESERVED,
+                    exclude,
+                )?
+            }
+        };
 
         Ok(NetworkInfo {
             tap_device: String::new(),
@@ -73,7 +155,7 @@ impl NetworkBackend for MacosNetwork {
         })
     }
 
-    fn teardown(&self, vm: &VmMetadata) -> Result<()> {
+    fn teardown(&self, vm: &VmMetadata, _config: &GlobalConfig) -> Result<()> {
         let _ = network::ip::release(&self.store, &vm.name);
         Ok(())
     }
@@ -165,5 +247,59 @@ destination: default
     #[test]
     fn parse_route_empty() {
         assert_eq!(parse_interface_from_route(""), None);
+    }
+
+    // ── vmnet sub-range derivation ───────────────────────────────
+
+    #[test]
+    fn vmnet_subnet_lands_in_192_168_64_slash_24() {
+        for id in ["0000", "a3f4", "ffff", "dead", "beef"] {
+            let subnet = derive_vmnet_subnet(id);
+            assert!(
+                subnet.starts_with("192.168.64."),
+                "instance id {id} produced subnet outside vmnet's /24: {subnet}"
+            );
+            assert!(
+                subnet.ends_with("/27"),
+                "instance id {id} produced non-/27 subnet: {subnet}"
+            );
+        }
+    }
+
+    #[test]
+    fn vmnet_subnet_uses_low_three_bits_of_id() {
+        // Same low 3 bits → same slot; bits 3-15 don't move it.
+        // 0x0007 and 0xffff both end in 0b111 → slot 7 → base 224.
+        assert_eq!(derive_vmnet_subnet("0007"), "192.168.64.224/27");
+        assert_eq!(derive_vmnet_subnet("ffff"), "192.168.64.224/27");
+        // 0x0000 → slot 0 → base 0.
+        assert_eq!(derive_vmnet_subnet("0000"), "192.168.64.0/27");
+        // 0x0008 → slot 0 → base 0 (only low 3 bits matter).
+        assert_eq!(derive_vmnet_subnet("0008"), "192.168.64.0/27");
+    }
+
+    #[test]
+    fn vmnet_subnet_is_stable() {
+        // Reactivation must land on the same /27 the install was
+        // initialized with, otherwise allocations.json's pinned
+        // `base_subnet` mismatches and `network::ip::allocate`
+        // refuses to hand out IPs.
+        assert_eq!(derive_vmnet_subnet("a3f4"), derive_vmnet_subnet("a3f4"));
+    }
+
+    #[test]
+    #[should_panic(expected = "non-hex instance_id")]
+    fn vmnet_subnet_panics_on_non_hex_id() {
+        // CLI validation guarantees a 4-hex `instance_id`; a non-hex
+        // value reaching this function means validation regressed.
+        // We'd rather panic loudly than silently collide every such
+        // install on slot 0.
+        let _ = derive_vmnet_subnet("zzzz");
+    }
+
+    #[test]
+    #[should_panic(expected = "non-hex instance_id")]
+    fn vmnet_subnet_panics_on_empty_id() {
+        let _ = derive_vmnet_subnet("");
     }
 }

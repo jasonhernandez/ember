@@ -3,9 +3,10 @@ use std::path::{Path, PathBuf};
 use clap::{Args, Subcommand};
 use uuid::Uuid;
 
-use super::fmt::{format_bytes_binary, GIB, MIB};
+use super::fmt::{format_bytes_binary, print_table, Align, GIB, MIB};
 use crate::backend::{
-    CurrentPlatform, Network, NetworkBackend, Platform, Storage, StorageBackend, Vm, VmBackend,
+    create_storage, CurrentPlatform, Network, NetworkBackend, Platform, Storage, Vm, VmBackend,
+    VolumeHandle,
 };
 use crate::image;
 use ember_core::config;
@@ -15,6 +16,34 @@ use ember_core::error::Error;
 use ember_core::image::registry::ImageRegistry;
 use ember_core::state::store::StateStore;
 use ember_core::state::vm::{self, NetworkInfo, SshConfig, VmMetadata, VmStatus};
+
+/// Build a placeholder [`VmMetadata`] from a freshly returned
+/// [`VolumeHandle`].
+///
+/// Used between `clone_for_vm`/`clone_vm_storage` and the moment the
+/// fully populated metadata is constructed: the storage backend reads
+/// `name`, `disk_path`, and `thin_id` from this stub for resize, mount,
+/// and SSH-key injection. All other fields are placeholders inherited
+/// from [`VmMetadata::default_for_teardown`].
+fn pending_metadata(name: &str, handle: &VolumeHandle, disk_size_gib: u32) -> VmMetadata {
+    let mut m = VmMetadata::default_for_teardown();
+    m.name = name.to_string();
+    m.disk_path = handle.disk_path.to_string_lossy().into_owned();
+    m.thin_id = handle.thin_id;
+    // dm-thin needs the size to (re)activate the thin device. Stash the
+    // requested disk size so `disk_device_path(pending)` can re-attach
+    // post-resize even if the kernel state was somehow torn down.
+    m.disk_size_gib = disk_size_gib;
+    m
+}
+
+/// Build a placeholder [`VmMetadata`] when only the name is available
+/// (e.g., recovery paths where the real record can no longer be loaded).
+fn name_only_metadata(name: &str) -> VmMetadata {
+    let mut m = VmMetadata::default_for_teardown();
+    m.name = name.to_string();
+    m
+}
 
 /// Load a running VM with network info, checking that the guest IP is resolved.
 ///
@@ -517,25 +546,24 @@ fn create(args: &CreateArgs, state_dir: &Path) -> anyhow::Result<()> {
             )
         })?;
 
-    let image_name = image_entry.local_name.clone();
     let image_ref = image_entry.reference.clone();
     let image_size_mib = image_entry.size_mib;
 
-    let storage = Storage::new(&global_config);
+    let storage = create_storage(&global_config);
 
     let mut rollback = Rollback::new();
 
     // Clone base image → per-VM disk (instant, copy-on-write).
     eprintln!("Cloning image for VM '{}'...", resolved.name);
-    let vm_disk_path = storage.clone_for_vm(&image_name, &resolved.name)?;
-    let vm_disk = vm_disk_path.to_string_lossy().to_string();
+    let handle = storage.clone_for_vm(image_entry, &resolved.name)?;
+    let pending = pending_metadata(&resolved.name, &handle, resolved.disk_size);
     {
         let storage = storage.clone();
         let sd = state_dir.to_path_buf();
-        let name = resolved.name.clone();
+        let pending = pending.clone();
         rollback.push("VM storage clone", move || {
-            let _ = storage.destroy_vm_storage(&name);
-            let _ = vm::delete(&StateStore::new(sd), &name);
+            let _ = storage.destroy_vm_storage(&pending);
+            let _ = vm::delete(&StateStore::new(sd), &pending.name);
         });
     }
 
@@ -544,7 +572,7 @@ fn create(args: &CreateArgs, state_dir: &Path) -> anyhow::Result<()> {
         &store,
         &mut global_config,
         &storage,
-        &vm_disk,
+        &pending,
         image_size_mib,
         &image_ref,
     )?;
@@ -627,12 +655,15 @@ fn wait_for_ssh(store: &StateStore, vm_name: &str, timeout_secs: u64) -> anyhow:
 /// Post-clone steps: grow disk, inject SSH key, save metadata.
 ///
 /// Separated from [`create`] so the caller can clean up storage on failure.
+/// `pending` is the in-progress VM metadata (built from the [`VolumeHandle`]
+/// returned by `clone_for_vm`); the storage backend reads `name`, `disk_path`,
+/// and `thin_id` from it for the resize/inject calls below.
 fn create_post_clone(
     resolved: &ResolvedVmCreate,
     store: &StateStore,
     global_config: &mut GlobalConfig,
     storage: &Storage,
-    vm_disk: &str,
+    pending: &VmMetadata,
     image_size_mib: u64,
     image_ref: &str,
 ) -> anyhow::Result<()> {
@@ -644,16 +675,13 @@ fn create_post_clone(
             "Growing disk to {}...",
             format_bytes_binary(resolved.disk_size as u64 * GIB)
         );
-        storage.resize(
-            &resolved.name,
-            ByteSize::from_gib(resolved.disk_size as u64),
-        )?;
+        storage.resize(pending, ByteSize::from_gib(resolved.disk_size as u64))?;
     }
 
     // Inject per-VM SSH key into the rootfs image.
     // Linux: mounts the block device, writes the key, unmounts.
     // macOS: uses debugfs to write directly into the ext4 image.
-    let dev_path = storage.disk_device_path(&resolved.name);
+    let dev_path = storage.disk_device_path(pending)?;
     let pubkey_path = image::inject::default_ssh_pubkey_path().ok_or_else(|| {
         anyhow::anyhow!(
             "no SSH public key found at ~/.ssh/id_ed25519.pub or ~/.ssh/id_rsa.pub\n\
@@ -677,7 +705,8 @@ fn create_post_clone(
             .unwrap_or_else(|| PathBuf::from("/root/.ssh/id_ed25519"))
     });
 
-    // Build and save VM metadata.
+    // Build and save VM metadata. The disk path and thin_id come from
+    // the pending stub built right after `clone_for_vm` returned.
     let metadata = VmMetadata {
         name: resolved.name.clone(),
         id: Uuid::new_v4(),
@@ -687,7 +716,7 @@ fn create_post_clone(
         memory_mib: resolved.memory,
         disk_size_gib: resolved.disk_size,
         kernel_path,
-        disk_path: vm_disk.to_string(),
+        disk_path: pending.disk_path.clone(),
         boot_args: resolved.boot_args.clone(),
         subnet: resolved.network.clone(),
         network: None,
@@ -700,6 +729,7 @@ fn create_post_clone(
         },
         parent_vm: None,
         vsock: resolved.vsock_info(store)?,
+        thin_id: pending.thin_id,
     };
 
     vm::save(store, &metadata)?;
@@ -758,23 +788,23 @@ fn fork(args: &ForkArgs, state_dir: &Path) -> anyhow::Result<()> {
 
     let subnet = args.network.clone().or(source.subnet.clone());
 
-    let storage = Storage::new(&global_config);
+    let storage = create_storage(&global_config);
 
     // Clone source VM's storage into the new VM via the storage backend.
     println!("Forking '{}' → '{}'...", args.source, args.name);
-    let vm_disk_path = storage.clone_vm_storage(&args.source, &args.name)?;
-    let vm_disk = vm_disk_path.to_string_lossy().to_string();
+    let handle = storage.clone_vm_storage(&source, &args.name)?;
+    let pending = pending_metadata(&args.name, &handle, disk_size_gib);
 
     let mut rollback = Rollback::new();
     {
         let storage = storage.clone();
-        let parent = args.source.clone();
+        let parent = source.clone();
+        let pending = pending.clone();
         let sd = state_dir.to_path_buf();
-        let name = args.name.clone();
         rollback.push("fork clone + snapshot", move || {
-            let _ = storage.destroy_vm_storage(&name);
-            let _ = storage.cleanup_fork(&parent, &name);
-            let _ = vm::delete(&StateStore::new(sd), &name);
+            let _ = storage.destroy_vm_storage(&pending);
+            let _ = storage.cleanup_fork(&parent, &pending);
+            let _ = vm::delete(&StateStore::new(sd), &pending.name);
         });
     }
 
@@ -785,12 +815,12 @@ fn fork(args: &ForkArgs, state_dir: &Path) -> anyhow::Result<()> {
             "Growing disk to {}...",
             format_bytes_binary(disk_size_gib as u64 * GIB)
         );
-        storage.resize(&args.name, ByteSize::from_gib(disk_size_gib as u64))?;
+        storage.resize(&pending, ByteSize::from_gib(disk_size_gib as u64))?;
     }
 
     // Inject /etc/hosts with the new VM's hostname (the cloned disk
     // still has the source VM's hostname from its creation).
-    let dev_path = storage.disk_device_path(&args.name);
+    let dev_path = storage.disk_device_path(&pending)?;
     storage.inject_hostname(&dev_path, &args.name)?;
 
     // Resolve kernel: CLI override or inherit from source.
@@ -810,7 +840,7 @@ fn fork(args: &ForkArgs, state_dir: &Path) -> anyhow::Result<()> {
         memory_mib,
         disk_size_gib,
         kernel_path,
-        disk_path: vm_disk,
+        disk_path: pending.disk_path.clone(),
         boot_args: source.boot_args.clone(),
         subnet,
         network: None,
@@ -830,6 +860,7 @@ fn fork(args: &ForkArgs, state_dir: &Path) -> anyhow::Result<()> {
         } else {
             None
         },
+        thin_id: pending.thin_id,
     };
 
     vm::save(&store, &metadata)?;
@@ -847,6 +878,46 @@ fn fork(args: &ForkArgs, state_dir: &Path) -> anyhow::Result<()> {
         )?;
     }
 
+    Ok(())
+}
+
+/// Maximum fraction of host RAM the sum of all running VMs is allowed
+/// to reserve. The kernel OOM-kills at 100%; we leave ~20% for the host
+/// itself (kernel, page cache, the user's shells/editor/browser) plus
+/// VM-side overhead that isn't billed against `memory_mib` (firecracker
+/// RSS, KVM/EPT slab, virtio buffers).
+const MAX_HOST_RAM_FRACTION: f64 = 0.80;
+
+/// Refuse a `vm start` that would push committed guest RAM past
+/// [`MAX_HOST_RAM_FRACTION`] of host RAM. This is the only thing
+/// standing between the user and "I forgot how big my VMs already are";
+/// firecracker itself has no notion of host capacity.
+fn check_admission(store: &StateStore, vm_name: &str, requested_mib: u32) -> anyhow::Result<()> {
+    let host_mib = match CurrentPlatform::host_ram_mib() {
+        Ok(m) => m,
+        Err(e) => {
+            // Don't block on inability to read host RAM — fall back to
+            // pre-admission behavior (let the kernel be the backstop).
+            eprintln!("warning: skipping admission check: {e}");
+            return Ok(());
+        }
+    };
+    let committed_mib: u32 = vm::list(store)?
+        .iter()
+        .filter(|v| matches!(v.status, VmStatus::Running | VmStatus::Paused))
+        .map(|v| v.memory_mib)
+        .sum();
+    let new_total = committed_mib + requested_mib;
+    let cap = (host_mib as f64 * MAX_HOST_RAM_FRACTION) as u32;
+    if new_total > cap {
+        anyhow::bail!(
+            "starting '{vm_name}' ({requested_mib} MiB) would commit {new_total} MiB of guest RAM, \
+             exceeding the {pct}% cap of {cap} MiB on a host with {host_mib} MiB total \
+             ({committed_mib} MiB already committed by running VMs). \
+             Stop another VM first, or override per-VM memory with 'ember vm update-config'.",
+            pct = (MAX_HOST_RAM_FRACTION * 100.0) as u32,
+        );
+    }
     Ok(())
 }
 
@@ -883,6 +954,8 @@ fn start(args: &StartArgs, state_dir: &Path) -> anyhow::Result<()> {
             .into())
         }
     }
+
+    check_admission(&store, &metadata.name, metadata.memory_mib)?;
 
     let mut rollback = Rollback::new();
 
@@ -926,7 +999,7 @@ fn start(args: &StartArgs, state_dir: &Path) -> anyhow::Result<()> {
                 if let Some(b) = block {
                     poisoned.insert(b);
                 }
-                let _ = net_backend.teardown(&attempt_meta);
+                let _ = net_backend.teardown(&attempt_meta, &config);
                 eprintln!(
                     "  VM start failed on slot {} (transient VZ crash); \
                      retrying on next slot (attempt {}/{})...",
@@ -937,7 +1010,7 @@ fn start(args: &StartArgs, state_dir: &Path) -> anyhow::Result<()> {
             }
             Err(e) => {
                 // Non-retriable, or out of attempts: release this slot and bail.
-                let _ = net_backend.teardown(&attempt_meta);
+                let _ = net_backend.teardown(&attempt_meta, &config);
                 return Err(e.into());
             }
         }
@@ -949,13 +1022,14 @@ fn start(args: &StartArgs, state_dir: &Path) -> anyhow::Result<()> {
         let net = Network::new(StateStore::new(state_dir.to_path_buf()));
         let meta_name = metadata.name.clone();
         let net_info_clone = net_info.clone();
+        let config_clone = config.clone();
         rollback.push("network", move || {
             let teardown_meta = VmMetadata {
                 name: meta_name,
                 network: Some(net_info_clone),
                 ..VmMetadata::default_for_teardown()
             };
-            let _ = net.teardown(&teardown_meta);
+            let _ = net.teardown(&teardown_meta, &config_clone);
         });
     }
 
@@ -1035,7 +1109,8 @@ fn stop(args: &StopArgs, state_dir: &Path) -> anyhow::Result<()> {
 
     // Clean up networking via the backend.
     let net_backend = Network::new(store.clone());
-    let _ = net_backend.teardown(&metadata);
+    let config: GlobalConfig = store.read(&store.config_path())?;
+    let _ = net_backend.teardown(&metadata, &config);
 
     // Update metadata.
     metadata.status = VmStatus::Stopped;
@@ -1170,12 +1245,12 @@ fn resize(args: &ResizeArgs, state_dir: &Path) -> anyhow::Result<()> {
 
     // Grow the disk via the storage backend (handles resize + ext4 expand).
     let config: GlobalConfig = store.read(&store.config_path())?;
-    let storage = Storage::new(&config);
+    let storage = create_storage(&config);
     println!(
         "Resizing disk to {}...",
         format_bytes_binary(new_gib as u64 * GIB)
     );
-    storage.resize(&args.name, args.disk_size)?;
+    storage.resize(&metadata, args.disk_size)?;
 
     // Update metadata.
     metadata.disk_size_gib = new_gib;
@@ -1295,8 +1370,8 @@ fn delete(args: &DeleteArgs, state_dir: &Path) -> anyhow::Result<()> {
     // Check for storage-level dependents (e.g. ZFS fork snapshots with clones).
     // On macOS/APFS this always returns empty — forks are independent.
     let config: GlobalConfig = store.read(&store.config_path())?;
-    let storage = Storage::new(&config);
-    let dependents = storage.storage_dependents(name)?;
+    let storage = create_storage(&config);
+    let dependents = storage.storage_dependents(&metadata)?;
     if !dependents.is_empty() {
         if !args.force {
             anyhow::bail!(
@@ -1389,24 +1464,33 @@ pub fn force_delete_vm(store: &StateStore, metadata: &VmMetadata) -> anyhow::Res
         let _ = ember_core::state::vsock::release(store, &metadata.name);
     }
 
+    // Read the persisted config once and reuse it for both network
+    // teardown (needs the per-installation iptables comment) and
+    // storage teardown.
+    let config: GlobalConfig = store.read(&store.config_path())?;
+
     // Clean up networking via the backend.
     let net_backend = Network::new(store.clone());
-    let _ = net_backend.teardown(metadata);
+    let _ = net_backend.teardown(metadata, &config);
 
     // Platform-specific post-delete cleanup (e.g. udevadm settle on Linux).
     CurrentPlatform::post_delete_cleanup();
 
     // Destroy storage via the backend.
-    let config: GlobalConfig = store.read(&store.config_path())?;
-    let storage = Storage::new(&config);
+    let storage = create_storage(&config);
 
     println!("Destroying storage for VM '{}'...", metadata.name);
-    let _ = storage.destroy_vm_storage(&metadata.name);
+    let _ = storage.destroy_vm_storage(metadata);
 
     // Clean up fork-related resources on the parent VM (e.g. ZFS snapshot).
     // No-op on macOS/APFS where forks are independent.
-    if let Some(ref parent) = metadata.parent_vm {
-        let _ = storage.cleanup_fork(parent, &metadata.name);
+    if let Some(ref parent_name) = metadata.parent_vm {
+        // Use the parent's stored metadata if available; fall back to a
+        // name-only stub when the parent record is gone (e.g. cascade
+        // cleanup running in the wrong order).
+        let parent_md =
+            vm::load(store, parent_name).unwrap_or_else(|_| name_only_metadata(parent_name));
+        let _ = storage.cleanup_fork(&parent_md, metadata);
     }
 
     // Remove the VM state directory.
@@ -1490,34 +1574,48 @@ fn list(args: &ListArgs, state_dir: &Path) -> anyhow::Result<()> {
                 return Ok(());
             }
 
-            println!(
-                "{:<20} {:<10} {:<16} {:<6} {:>4} {:>8} {:>8}",
-                "NAME", "STATUS", "IP", "VSOCK", "CPUS", "MEM", "DISK"
+            // Combine our IP/VSOCK columns + anomaly warnings (SEC-419/460)
+            // with upstream's print_table helper for consistent alignment.
+            let rows: Vec<Vec<String>> = vms
+                .iter()
+                .map(|vm| {
+                    let ip = vm
+                        .network
+                        .as_ref()
+                        .map(|n| n.guest_ip.clone())
+                        .unwrap_or_else(|| "-".to_string());
+                    let vsock = if vm.vsock.is_some() { "v" } else { "-" };
+                    let suffix = if corrupt_vms.contains(&vm.name) {
+                        " [CORRUPTED]"
+                    } else {
+                        ""
+                    };
+                    vec![
+                        format!("{}{}", vm.name, suffix),
+                        vm.status.to_string(),
+                        vm.image.clone(),
+                        ip,
+                        vsock.to_string(),
+                        vm.cpus.to_string(),
+                        format_bytes_binary(vm.memory_mib as u64 * MIB),
+                        format_bytes_binary(vm.disk_size_gib as u64 * GIB),
+                    ]
+                })
+                .collect();
+            print_table(
+                &["NAME", "STATUS", "IMAGE", "IP", "VSOCK", "CPUS", "MEM", "DISK"],
+                &[
+                    Align::Left,
+                    Align::Left,
+                    Align::Left,
+                    Align::Left,
+                    Align::Left,
+                    Align::Right,
+                    Align::Right,
+                    Align::Right,
+                ],
+                &rows,
             );
-            for vm in &vms {
-                let ip = vm
-                    .network
-                    .as_ref()
-                    .map(|n| n.guest_ip.as_str())
-                    .unwrap_or("-");
-                let vsock = if vm.vsock.is_some() { "v" } else { "-" };
-                let suffix = if corrupt_vms.contains(&vm.name) {
-                    " [CORRUPTED]"
-                } else {
-                    ""
-                };
-                println!(
-                    "{:<20} {:<10} {:<16} {:<6} {:>4} {:>8} {:>8}{}",
-                    vm.name,
-                    vm.status,
-                    ip,
-                    vsock,
-                    vm.cpus,
-                    format_bytes_binary(vm.memory_mib as u64 * MIB),
-                    format_bytes_binary(vm.disk_size_gib as u64 * GIB),
-                    suffix,
-                );
-            }
             if !anomalies.is_empty() {
                 eprintln!();
                 eprintln!(

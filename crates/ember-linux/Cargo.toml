@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 description = "Linux backend for ember: Firecracker + ZFS + TAP/iptables"
 
+[lints]
+workspace = true
+
 [dependencies]
 ember-core = { workspace = true }
 serde = { workspace = true }
@@ -17,3 +20,4 @@ nix = { workspace = true, features = ["fs", "ioctl", "net", "signal", "process",
 anyhow = { workspace = true }
 uuid = { workspace = true }
 tempfile = { workspace = true }
+rand = { workspace = true }

@@ -1,5 +1,6 @@
 pub mod cp;
 pub mod debug;
+pub mod deinit;
 pub mod exec;
 pub(crate) mod fmt;
 pub mod image;
@@ -7,8 +8,8 @@ pub mod info;
 pub mod init;
 pub mod kernel;
 pub mod network;
-pub mod snapshot;
 pub mod ssh;
+pub mod storage;
 pub mod vm;
 
 use clap::{Parser, Subcommand};
@@ -58,10 +59,6 @@ pub enum Command {
     #[command(subcommand)]
     Kernel(kernel::KernelCommand),
 
-    /// Manage VM snapshots
-    #[command(subcommand)]
-    Snapshot(snapshot::SnapshotCommand),
-
     /// Inspect and clean up network slot allocations
     #[command(subcommand)]
     Network(network::NetworkCommand),
@@ -84,6 +81,13 @@ pub enum Command {
 
     /// Reconcile internal state with actual VM process state
     Reconcile,
+
+    /// Tear down ember (inverse of `ember init`)
+    Deinit(deinit::DeinitArgs),
+
+    /// Storage pool administration
+    #[command(subcommand)]
+    Storage(storage::StorageCommand),
 
     /// Print version information
     Version,
