@@ -10,16 +10,23 @@ build:
 	cargo build
 ifeq ($(UNAME),Darwin)
 	cd ember-vz && swift build
-	codesign --force --sign - --entitlements ember-vz/entitlements.plist ember-vz/.build/debug/ember-vz
+	# SEC-445: codesign the FINAL binary location after cp, not the source.
+	# `cp` invalidates the embedded code signature (the kernel rejects the
+	# first text page at runtime with "tainted:1"), causing every spawn to
+	# SIGKILL via the Code Signing Monitor before reaching dyld's `start`.
+	# Symptom: "ember-vz closed ready-fd without writing MAC address" with
+	# an empty per-VM log (helper dies before any user code runs).
 	cp ember-vz/.build/debug/ember-vz target/debug/
+	codesign --force --sign - --entitlements ember-vz/entitlements.plist target/debug/ember-vz
 endif
 
 release:
 	cargo build --release
 ifeq ($(UNAME),Darwin)
 	cd ember-vz && swift build -c release
-	codesign --force --sign - --entitlements ember-vz/entitlements.plist ember-vz/.build/release/ember-vz
+	# SEC-445: same fix as `build` — sign the final location, not the source.
 	cp ember-vz/.build/release/ember-vz target/release/
+	codesign --force --sign - --entitlements ember-vz/entitlements.plist target/release/ember-vz
 endif
 
 # Build emberd (in-VM daemon). Runs inside Linux VMs so the vsock listener
