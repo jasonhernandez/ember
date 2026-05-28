@@ -72,10 +72,26 @@ impl NetworkBackend for LinuxNetwork {
 
         // Add iptables NAT/forwarding rules tagged with this install's
         // comment so cleanup can scope to *this* installation.
+        //
+        // SEC-263: when the VM has an egress policy with `deny_all_other`,
+        // skip NAT's per-VM blanket `-A FORWARD -i tap -o wan -j ACCEPT`.
+        // That blanket would otherwise sit ahead of the egress DROP in
+        // the FORWARD chain and short-circuit it, making `deny_all_other`
+        // a no-op. The egress allow rules carry approved traffic
+        // instead, and the trailing DROP catches the rest.
+        let policy_enforced = vm
+            .egress
+            .as_ref()
+            .map(|p| p.deny_all_other)
+            .unwrap_or(false);
         let comment = network::nat::comment(ns);
-        if let Err(e) =
-            network::nat::add_rules(&tap_name, &allocation.guest_ip, &wan_iface, &comment)
-        {
+        if let Err(e) = network::nat::add_rules(
+            &tap_name,
+            &allocation.guest_ip,
+            &wan_iface,
+            &comment,
+            policy_enforced,
+        ) {
             let _ = network::tap::delete(&tap_name);
             let _ = network::ip::release(&self.store, &vm.name);
             return Err(e);

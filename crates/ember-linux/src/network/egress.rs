@@ -589,6 +589,91 @@ mod tests {
         assert_eq!(&del[2..], &orig[2..]);
     }
 
+    /// SEC-263 regression guard. Simulates the FORWARD chain after both
+    /// NAT and egress wire up (in the same order `network_backend.rs`
+    /// drives them) and asserts the egress DROP is not preceded by NAT's
+    /// per-VM blanket ACCEPT.
+    ///
+    /// Before the fix, NAT appended a blanket `-A FORWARD -i tap -o wan
+    /// -j ACCEPT` between the inserted egress allow ACCEPTs and the
+    /// appended egress DROP. Packets to a disallowed destination would
+    /// match the blanket and the DROP would never fire — `deny_all_other`
+    /// was silently inert.
+    ///
+    /// The chain is modeled by replaying iptables' append/insert
+    /// semantics on a Vec: `-I FORWARD 1` prepends, `-A FORWARD`
+    /// appends, anything else (POSTROUTING, etc.) is ignored.
+    #[test]
+    fn chain_order_drop_is_not_after_blanket_nat_accept() {
+        use crate::network::nat;
+        use ember_core::config::vm::VmEgressConfig;
+
+        let tap = "tap0";
+        let wan = "eth0";
+        let guest = "10.100.0.2";
+        let comment_tag = "ember:a3f4";
+        let policy = VmEgressConfig {
+            allow: vec!["1.2.3.4".into()],
+            deny_all_other: true,
+        };
+        let resolver = StubResolver::new(&[]);
+        let policy_enforced = policy.deny_all_other;
+
+        // Wire-up order matches setup() in network_backend.rs: NAT
+        // rules first, then egress rules.
+        let mut chain: Vec<Vec<String>> = Vec::new();
+        for r in nat::plan_add(tap, guest, wan, comment_tag, policy_enforced) {
+            apply_to_chain(&mut chain, r);
+        }
+        let egress_rules = generate_rules(&policy, guest, wan, comment_tag, &resolver);
+        for r in egress_rules {
+            apply_to_chain(&mut chain, r.into_args());
+        }
+
+        // Find the trailing DROP (egress default-deny) and any blanket
+        // per-VM forward ACCEPT (NAT). With the fix, no blanket exists
+        // when policy_enforced; the DROP is therefore not preceded by
+        // it. If a future change reintroduces the blanket ahead of the
+        // DROP, this test fails — the security-relevant property.
+        let drop_idx = chain
+            .iter()
+            .position(|r| r.last().map(|s| s.as_str()) == Some("DROP"))
+            .expect("egress DROP must be in chain");
+        let blanket_idx = chain.iter().position(|r| {
+            let s = r.as_slice();
+            s.windows(2).any(|w| w == ["-i", tap])
+                && s.windows(2).any(|w| w == ["-o", wan])
+                && !s.iter().any(|tok| tok == "conntrack")
+                && s.last().map(|t| t.as_str()) == Some("ACCEPT")
+        });
+        match blanket_idx {
+            None => { /* good: no blanket present */ }
+            Some(b) => assert!(
+                b > drop_idx,
+                "regression: NAT blanket per-VM ACCEPT (pos {}) sits before \
+                 egress DROP (pos {}); deny_all_other would be inert. Chain: {:#?}",
+                b,
+                drop_idx,
+                chain
+            ),
+        }
+    }
+
+    /// Mirror of iptables's chain mutation for the rules we emit:
+    ///  - `-I FORWARD 1 …`  → prepend at index 0
+    ///  - `-A FORWARD …`    → append at end
+    ///
+    /// Other rules (e.g. `-t nat -A POSTROUTING`) live in a different
+    /// chain/table and don't participate in FORWARD's order.
+    fn apply_to_chain(chain: &mut Vec<Vec<String>>, rule: Vec<String>) {
+        let mut it = rule.iter();
+        match (it.next().map(String::as_str), it.next().map(String::as_str)) {
+            (Some("-I"), Some("FORWARD")) => chain.insert(0, rule),
+            (Some("-A"), Some("FORWARD")) => chain.push(rule),
+            _ => { /* not a FORWARD-chain rule for our purposes */ }
+        }
+    }
+
     #[test]
     fn comment_appears_exactly_once_per_rule() {
         let policy = VmEgressConfig {

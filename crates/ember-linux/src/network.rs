@@ -22,6 +22,12 @@ use ember_core::state::vm::VmMetadata;
 /// — a name whose records changed between start and stop may leak
 /// the obsolete IPs as orphaned ACCEPT rules; the trailing DROP is
 /// shape-stable and always gets cleaned.
+///
+/// TODO(SEC-263): replace the re-resolve+regenerate cleanup with a
+/// deletion keyed on a stable per-VM iptables comment tag (mirroring
+/// what `nat::remove_rules` does), so cleanup is hostname-independent
+/// and orphaned ACCEPT rules can't leak when a record changes between
+/// start and stop. Out of scope for the deny-all-other bug fix.
 pub fn cleanup(store: &StateStore, config: &GlobalConfig, vm: &VmMetadata) {
     let net_info = match vm.network.as_ref() {
         Some(n) => n,
