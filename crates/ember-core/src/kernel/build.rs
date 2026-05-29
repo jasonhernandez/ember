@@ -125,8 +125,10 @@ pub fn build(store: &StateStore, jobs: usize, tool: &str) -> anyhow::Result<Path
     // Build the boot artifact each backend needs:
     //   - x86_64 (Firecracker): ELF `vmlinux`
     //   - aarch64 (AVF): the ARM64 boot `Image` (AVF can't boot ELF vmlinux)
-    // Build both targets unconditionally so the container layer stays
-    // arch-agnostic; we copy the right one out below (SEC-475 #4).
+    // `Image` is an arm64-only make target — `make Image` does NOT exist under
+    // arch/x86 and would fail the `set -e` build on x86_64. So gate the make
+    // target by arch, same as the install path (SEC-475 #4).
+    let make_targets = kernel_make_targets();
     let build_script = format!(
         "set -e\n\
          echo '==> Downloading Firecracker CI kernel config...'\n\
@@ -139,7 +141,7 @@ pub fn build(store: &StateStore, jobs: usize, tool: &str) -> anyhow::Result<Path
          sed -i 's/^CONFIG_BUILD_SALT=.*/CONFIG_BUILD_SALT=\"\"/' .config\n\
          make olddefconfig\n\
          echo '==> Building kernel ({jobs} jobs)...'\n\
-         make -j{jobs} vmlinux Image\n\
+         make -j{jobs} {make_targets}\n\
          echo '==> Done.'"
     );
 
@@ -213,6 +215,18 @@ fn built_kernel_subpath() -> &'static str {
     match std::env::consts::ARCH {
         "aarch64" => "linux/arch/arm64/boot/Image",
         _ => "linux/vmlinux",
+    }
+}
+
+/// `make` target(s) for the boot artifact on the build host arch.
+///
+/// `Image` is an arm64-only target (arch/arm64); x86 has no `Image` rule, only
+/// `vmlinux`/`bzImage`. Building the wrong target fails the `set -e` build, so
+/// each arch builds exactly the artifact [`built_kernel_subpath`] installs.
+fn kernel_make_targets() -> &'static str {
+    match std::env::consts::ARCH {
+        "aarch64" => "Image",
+        _ => "vmlinux",
     }
 }
 
@@ -315,5 +329,20 @@ mod tests {
     #[test]
     fn built_subpath_is_vmlinux_off_arm() {
         assert_eq!(built_kernel_subpath(), "linux/vmlinux");
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn make_targets_is_image_on_arm() {
+        // `Image` is the arm64 boot target; building it (not bare `vmlinux`)
+        // is what produces arch/arm64/boot/Image for AVF.
+        assert_eq!(kernel_make_targets(), "Image");
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    #[test]
+    fn make_targets_is_vmlinux_off_arm() {
+        // x86 has no `Image` make target — building it would fail `set -e`.
+        assert_eq!(kernel_make_targets(), "vmlinux");
     }
 }
