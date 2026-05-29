@@ -84,9 +84,9 @@ pub fn run(state_dir: &Path) {
                 "Warning: VM '{}' process (pid {pid}) is dead, marking stopped",
                 metadata.name
             );
-            if let Some(ref net_info) = metadata.network {
+            if metadata.network.is_some() {
                 if let Some(ref cfg) = config {
-                    network::cleanup(&store, cfg, &metadata.name, net_info);
+                    network::cleanup(&store, cfg, &metadata);
                 }
             }
             mark_stopped(&store, &mut metadata);

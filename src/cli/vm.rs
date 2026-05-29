@@ -134,6 +134,17 @@ pub struct CreateArgs {
     #[arg(long)]
     pub network: Option<String>,
 
+    /// Per-VM egress allow-list (comma-separated hostnames or CIDRs).
+    ///
+    /// When set, a default-deny is appended so anything not on the
+    /// allow list is dropped. Example:
+    /// `--egress-allow "api.anthropic.com,github.com,10.0.0.0/8"`.
+    ///
+    /// Linux only; macOS prints an unsupported-OS warning and skips
+    /// enforcement.
+    #[arg(long = "egress-allow", value_delimiter = ',')]
+    pub egress_allow: Vec<String>,
+
     /// VM config YAML file
     #[arg(long = "vm-config")]
     pub vm_config: Option<PathBuf>,
@@ -360,6 +371,8 @@ struct ResolvedVmCreate {
     ssh_key: Option<PathBuf>,
     /// Whether vsock is enabled for this VM.
     vsock: bool,
+    /// Optional egress allow-list policy.
+    egress: Option<config::vm::VmEgressConfig>,
 }
 
 /// Maximum Unix domain socket path length.
@@ -457,6 +470,15 @@ fn resolve_create_config(
 
     let vsock = args.vsock || yaml.and_then(|c| c.vsock).unwrap_or(false);
 
+    // Merge order for egress:
+    //   YAML provides the base policy (incl. deny_all_other), then any
+    //   --egress-allow entries on the CLI are appended. The CLI also
+    //   force-enables deny_all_other — supplying an allow list on the
+    //   CLI without a default deny would be a footgun (rules accept some
+    //   traffic but everything else is still allowed by the existing
+    //   ACCEPT rule).
+    let egress = build_egress_policy(&args.egress_allow, yaml);
+
     Ok(ResolvedVmCreate {
         name: args.name.clone(),
         image,
@@ -472,7 +494,55 @@ fn resolve_create_config(
         ssh_user,
         ssh_key,
         vsock,
+        egress,
     })
+}
+
+/// Build the merged egress policy from CLI + YAML config.
+///
+/// Returns `None` when neither source contributes anything (preserves
+/// the legacy allow-all behavior). CLI entries are appended to YAML
+/// entries, deduplicated by string equality (preserving order — first
+/// occurrence wins). `deny_all_other` ORs the two sources together, so
+/// either side enabling it locks the policy.
+fn build_egress_policy(
+    cli_allow: &[String],
+    yaml: Option<&config::vm::VmConfig>,
+) -> Option<config::vm::VmEgressConfig> {
+    let yaml_eg = yaml
+        .and_then(|c| c.network.as_ref())
+        .and_then(|n| n.egress.as_ref());
+
+    if cli_allow.is_empty() && yaml_eg.is_none() {
+        return None;
+    }
+
+    let mut allow: Vec<String> = yaml_eg.map(|e| e.allow.clone()).unwrap_or_default();
+    for entry in cli_allow {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !allow.iter().any(|a| a == trimmed) {
+            allow.push(trimmed.to_string());
+        }
+    }
+
+    // CLI presence implies "I want a real allow-list" → default-deny.
+    // YAML can independently set it (or not).
+    let deny_all_other =
+        !cli_allow.is_empty() || yaml_eg.map(|e| e.deny_all_other).unwrap_or(false);
+
+    let policy = config::vm::VmEgressConfig {
+        allow,
+        deny_all_other,
+    };
+
+    if policy.is_empty() {
+        None
+    } else {
+        Some(policy)
+    }
 }
 
 /// Resolve the kernel path: CLI/YAML spec → global config → auto-download default preset.
@@ -719,6 +789,7 @@ fn create_post_clone(
         disk_path: pending.disk_path.clone(),
         boot_args: resolved.boot_args.clone(),
         subnet: resolved.network.clone(),
+        egress: resolved.egress.clone(),
         network: None,
         pid: None,
         api_socket: store.vm_dir(&resolved.name).join("firecracker.sock"),
@@ -843,6 +914,7 @@ fn fork(args: &ForkArgs, state_dir: &Path) -> anyhow::Result<()> {
         disk_path: pending.disk_path.clone(),
         boot_args: source.boot_args.clone(),
         subnet,
+        egress: source.egress.clone(),
         network: None,
         pid: None,
         api_socket: store.vm_dir(&args.name).join("firecracker.sock"),
@@ -1767,6 +1839,53 @@ fn stats(args: &StatsArgs, state_dir: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_egress_policy_none_when_empty() {
+        assert!(build_egress_policy(&[], None).is_none());
+    }
+
+    #[test]
+    fn build_egress_policy_cli_forces_deny() {
+        let pol = build_egress_policy(&["github.com".into(), "10.0.0.0/8".into()], None).unwrap();
+        assert_eq!(pol.allow, vec!["github.com", "10.0.0.0/8"]);
+        assert!(pol.deny_all_other);
+    }
+
+    fn yaml_with_egress(allow: &[&str], deny_all_other: bool) -> config::vm::VmConfig {
+        config::vm::VmConfig {
+            network: Some(config::vm::VmNetworkConfig {
+                subnet: None,
+                egress: Some(config::vm::VmEgressConfig {
+                    allow: allow.iter().map(|s| s.to_string()).collect(),
+                    deny_all_other,
+                }),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn build_egress_policy_merges_yaml_and_cli() {
+        let yaml = yaml_with_egress(&["api.anthropic.com", "github.com"], false);
+        let pol =
+            build_egress_policy(&["pypi.org".into(), "github.com".into()], Some(&yaml)).unwrap();
+        // YAML entries first, then CLI entries (dedup preserves first-seen order).
+        assert_eq!(
+            pol.allow,
+            vec!["api.anthropic.com", "github.com", "pypi.org"]
+        );
+        // CLI presence force-enables deny_all_other even when YAML said false.
+        assert!(pol.deny_all_other);
+    }
+
+    #[test]
+    fn build_egress_policy_yaml_only_preserves_deny_setting() {
+        let yaml = yaml_with_egress(&["10.0.0.0/8"], true);
+        let pol = build_egress_policy(&[], Some(&yaml)).unwrap();
+        assert_eq!(pol.allow, vec!["10.0.0.0/8"]);
+        assert!(pol.deny_all_other);
+    }
 
     #[test]
     fn validate_uds_path_short_ok() {

@@ -31,12 +31,12 @@ pub fn comment(instance_id: Option<&str>) -> String {
 
 /// Add iptables NAT and forwarding rules for a VM.
 ///
-/// Creates three rules that together give the guest outbound internet access
+/// Creates rules that together give the guest outbound internet access
 /// through the host's WAN interface via masquerading (SNAT):
 ///
 /// ```text
 /// -t nat -A POSTROUTING -s <guest_ip>/32 -o <wan_iface> [-m comment --comment <c>] -j MASQUERADE
-/// -A FORWARD -i <tap_device> -o <wan_iface> [-m comment --comment <c>] -j ACCEPT
+/// -A FORWARD -i <tap_device> -o <wan_iface> [-m comment --comment <c>] -j ACCEPT       (omitted when policy_enforced)
 /// -A FORWARD -i <wan_iface> -o <tap_device> -m conntrack --ctstate RELATED,ESTABLISHED [-m comment --comment <c>] -j ACCEPT
 /// ```
 ///
@@ -46,48 +46,103 @@ pub fn comment(instance_id: Option<&str>) -> String {
 /// "rules ember put here". An empty `comment` skips the match entirely
 /// so rules added by older ember binaries (which never tagged anything)
 /// stay byte-for-byte identical and remain matchable by `remove_rules`.
-pub fn add_rules(tap_device: &str, guest_ip: &str, wan_iface: &str, comment: &str) -> Result<()> {
-    let guest_cidr = format!("{guest_ip}/32");
-
-    iptables(&with_comment(
-        &[
-            "-t",
-            "nat",
-            "-A",
-            "POSTROUTING",
-            "-s",
-            &guest_cidr,
-            "-o",
-            wan_iface,
-        ],
-        comment,
-        &["-j", "MASQUERADE"],
-    ))?;
-
-    iptables(&with_comment(
-        &["-A", "FORWARD", "-i", tap_device, "-o", wan_iface],
-        comment,
-        &["-j", "ACCEPT"],
-    ))?;
-
-    iptables(&with_comment(
-        &[
-            "-A",
-            "FORWARD",
-            "-i",
-            wan_iface,
-            "-o",
-            tap_device,
-            "-m",
-            "conntrack",
-            "--ctstate",
-            "RELATED,ESTABLISHED",
-        ],
-        comment,
-        &["-j", "ACCEPT"],
-    ))?;
-
+///
+/// `policy_enforced` (SEC-263): when the VM has an egress policy with
+/// `deny_all_other` active, the egress module already supplies per-VM
+/// allow ACCEPTs (inserted at `-I FORWARD 1`) and a trailing
+/// `-A FORWARD … -j DROP`. NAT's own per-VM blanket `-A FORWARD -i tap
+/// -o wan -j ACCEPT` would otherwise sit between them and short-circuit
+/// the DROP, silently turning `deny_all_other` into a no-op. Set
+/// `policy_enforced = true` to skip that blanket rule; the egress
+/// allow rules carry approved traffic and the DROP catches the rest.
+/// The conntrack return rule is unaffected — return traffic for
+/// allowed flows still needs to be accepted.
+pub fn add_rules(
+    tap_device: &str,
+    guest_ip: &str,
+    wan_iface: &str,
+    comment: &str,
+    policy_enforced: bool,
+) -> Result<()> {
+    for rule in plan_add(tap_device, guest_ip, wan_iface, comment, policy_enforced) {
+        let borrowed: Vec<&str> = rule.iter().map(String::as_str).collect();
+        iptables(&borrowed)?;
+    }
     Ok(())
+}
+
+/// Pure: the argv list `add_rules` would hand to iptables, in order.
+///
+/// Factored out so the chain-order regression for SEC-263 (the blanket
+/// FORWARD ACCEPT must not be present when `policy_enforced`) can be
+/// asserted without driving iptables. Same parameters and semantics as
+/// [`add_rules`].
+pub fn plan_add(
+    tap_device: &str,
+    guest_ip: &str,
+    wan_iface: &str,
+    comment: &str,
+    policy_enforced: bool,
+) -> Vec<Vec<String>> {
+    let guest_cidr = format!("{guest_ip}/32");
+    let mut out: Vec<Vec<String>> = Vec::new();
+
+    out.push(
+        with_comment(
+            &[
+                "-t",
+                "nat",
+                "-A",
+                "POSTROUTING",
+                "-s",
+                &guest_cidr,
+                "-o",
+                wan_iface,
+            ],
+            comment,
+            &["-j", "MASQUERADE"],
+        )
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect(),
+    );
+
+    if !policy_enforced {
+        out.push(
+            with_comment(
+                &["-A", "FORWARD", "-i", tap_device, "-o", wan_iface],
+                comment,
+                &["-j", "ACCEPT"],
+            )
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+        );
+    }
+
+    out.push(
+        with_comment(
+            &[
+                "-A",
+                "FORWARD",
+                "-i",
+                wan_iface,
+                "-o",
+                tap_device,
+                "-m",
+                "conntrack",
+                "--ctstate",
+                "RELATED,ESTABLISHED",
+            ],
+            comment,
+            &["-j", "ACCEPT"],
+        )
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect(),
+    );
+
+    out
 }
 
 /// Remove iptables NAT and forwarding rules for a VM.
@@ -98,6 +153,12 @@ pub fn add_rules(tap_device: &str, guest_ip: &str, wan_iface: &str, comment: &st
 /// iptables compares the full rule including the comment match, so a
 /// wrong tag turns the delete into a no-op rather than removing
 /// another install's rule.
+///
+/// The blanket forward `-D` is always attempted regardless of
+/// `policy_enforced` — `iptables -D` of a non-existent rule is a
+/// silent no-op (handled in [`iptables_delete`]), so an over-broad
+/// delete is harmless. This also self-heals VMs that pre-date the
+/// SEC-263 fix where the blanket rule may still be present.
 pub fn remove_rules(
     tap_device: &str,
     guest_ip: &str,
@@ -178,7 +239,10 @@ pub fn enable_ip_forwarding() -> Result<()> {
 }
 
 /// Run an iptables command, returning an error on failure.
-fn iptables(args: &[&str]) -> Result<()> {
+///
+/// Exposed within the crate so the egress module can drive
+/// pre-generated rules without re-implementing process wiring.
+pub(crate) fn iptables(args: &[&str]) -> Result<()> {
     let output = Command::new("iptables")
         .args(args)
         .output()
@@ -197,7 +261,7 @@ fn iptables(args: &[&str]) -> Result<()> {
 /// same IP), we need to loop until all copies are gone.
 ///
 /// Silently ignores "rule doesn't exist" errors for idempotent cleanup.
-fn iptables_delete(args: &[&str]) -> Result<()> {
+pub(crate) fn iptables_delete(args: &[&str]) -> Result<()> {
     loop {
         let output =
             Command::new("iptables")
@@ -251,6 +315,59 @@ mod tests {
         // won't match existing rules on upgraded hosts.
         let args = with_comment(&["-A", "FORWARD", "-i", "tap0"], "", &["-j", "ACCEPT"]);
         assert_eq!(args, vec!["-A", "FORWARD", "-i", "tap0", "-j", "ACCEPT"]);
+    }
+
+    /// SEC-263 regression guard: when an egress policy with
+    /// `deny_all_other` is active, NAT must not append its per-VM
+    /// blanket `-A FORWARD -i tap -o wan -j ACCEPT`. If it does, it
+    /// sits ahead of the egress DROP and silently turns
+    /// `deny_all_other` into a no-op.
+    #[test]
+    fn plan_add_omits_blanket_forward_when_policy_enforced() {
+        let plan = plan_add("tap0", "10.100.0.2", "eth0", "ember:a3f4", true);
+        // The blanket rule has `-i tap0 -o eth0` (forward direction).
+        // The conntrack return rule has `-i eth0 -o tap0` — we want
+        // that one to remain so return traffic for allowed flows is
+        // accepted.
+        let has_blanket = plan.iter().any(|r| {
+            let s = r.as_slice();
+            // Look for the exact "forward direction" pattern.
+            s.windows(2).any(|w| w == ["-i", "tap0"])
+                && s.windows(2).any(|w| w == ["-o", "eth0"])
+                && !s.iter().any(|tok| tok == "conntrack")
+        });
+        assert!(
+            !has_blanket,
+            "blanket per-VM forward ACCEPT must be omitted when egress \
+             policy enforces deny_all_other: {:?}",
+            plan
+        );
+        // Conntrack return rule must still be present.
+        let has_return = plan.iter().any(|r| r.iter().any(|tok| tok == "conntrack"));
+        assert!(
+            has_return,
+            "conntrack return ACCEPT must be kept even when policy_enforced: {:?}",
+            plan
+        );
+    }
+
+    /// And without policy enforcement, the blanket forward ACCEPT
+    /// must still be present (no behavior change for VMs without an
+    /// egress policy or with `deny_all_other: false`).
+    #[test]
+    fn plan_add_keeps_blanket_forward_when_not_policy_enforced() {
+        let plan = plan_add("tap0", "10.100.0.2", "eth0", "ember:a3f4", false);
+        let has_blanket = plan.iter().any(|r| {
+            let s = r.as_slice();
+            s.windows(2).any(|w| w == ["-i", "tap0"])
+                && s.windows(2).any(|w| w == ["-o", "eth0"])
+                && !s.iter().any(|tok| tok == "conntrack")
+        });
+        assert!(
+            has_blanket,
+            "blanket per-VM forward ACCEPT must be present without policy enforcement: {:?}",
+            plan
+        );
     }
 
     #[test]

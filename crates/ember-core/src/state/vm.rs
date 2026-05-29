@@ -128,6 +128,12 @@ pub struct VmMetadata {
     /// Defaults to [`crate::config::GlobalConfig::ip_subnet`] when not set.
     #[serde(default)]
     pub subnet: Option<String>,
+    /// Per-VM egress allow-list policy (SEC-263). Absent → no policy
+    /// (preserves the original allow-all FORWARD behavior). Persisted
+    /// on the VM record so stop/start reapplies the same rules without
+    /// the caller having to re-supply the flag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress: Option<crate::config::vm::VmEgressConfig>,
     /// Network configuration, if networking is set up.
     pub network: Option<NetworkInfo>,
     /// PID of the running Firecracker process.
@@ -176,6 +182,7 @@ impl VmMetadata {
             disk_path: String::new(),
             boot_args: None,
             subnet: None,
+            egress: None,
             network: None,
             pid: None,
             api_socket: PathBuf::new(),
@@ -378,6 +385,7 @@ mod tests {
             disk_path: format!("tank/ember/vms/{name}"),
             boot_args: None,
             subnet: None,
+            egress: None,
             network: None,
             pid: None,
             api_socket: PathBuf::from(format!("/var/lib/ember/vms/{name}/firecracker.sock")),

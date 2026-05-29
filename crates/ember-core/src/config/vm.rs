@@ -46,6 +46,38 @@ pub struct VmConfig {
 pub struct VmNetworkConfig {
     /// Subnet for IP allocation (e.g., "10.100.0.0/16").
     pub subnet: Option<String>,
+    /// Optional egress policy (SEC-263). Absent → no policy, current behavior.
+    #[serde(default)]
+    pub egress: Option<VmEgressConfig>,
+}
+
+/// Per-VM egress allow-list policy (SEC-263).
+///
+/// Hostnames are resolved to IPs once at VM start; the resolution is
+/// **not** dynamic — DNS changes do not propagate to running rules.
+/// Re-create or restart the VM to pick up changed records.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
+pub struct VmEgressConfig {
+    /// Allowed egress destinations. Each entry is either a hostname
+    /// (resolved to one or more IPv4 addresses at VM start) or a
+    /// CIDR/IPv4 literal (passed through unchanged).
+    #[serde(default)]
+    pub allow: Vec<String>,
+    /// When true, append a final DROP rule so anything not matched by
+    /// `allow` is rejected. When false (or absent), no DROP is added —
+    /// the allow rules become "fast-path accepts" alongside any other
+    /// FORWARD rules the host already has.
+    #[serde(default)]
+    pub deny_all_other: bool,
+}
+
+impl VmEgressConfig {
+    /// True if the policy has neither an allow list nor a default-deny.
+    /// Such a policy is equivalent to "no policy" and we treat it as
+    /// absent so the network backend skips the egress rule pass entirely.
+    pub fn is_empty(&self) -> bool {
+        self.allow.is_empty() && !self.deny_all_other
+    }
 }
 
 /// SSH configuration within a VM YAML config.
@@ -208,6 +240,58 @@ boot_args: "console=ttyS0 reboot=k panic=1 pci=off"
         let yaml = "image: alpine:latest\n";
         let config: VmConfig = serde_yaml::from_str(yaml).unwrap();
         assert!(config.vsock.is_none());
+    }
+
+    #[test]
+    fn parse_egress_config() {
+        let yaml = r#"
+image: alpine:latest
+network:
+  subnet: 10.100.0.0/16
+  egress:
+    allow:
+      - api.anthropic.com
+      - github.com
+      - 10.0.0.0/8
+    deny_all_other: true
+"#;
+        let config: VmConfig = serde_yaml::from_str(yaml).unwrap();
+        let net = config.network.as_ref().unwrap();
+        let eg = net.egress.as_ref().unwrap();
+        assert_eq!(
+            eg.allow,
+            vec![
+                "api.anthropic.com".to_string(),
+                "github.com".to_string(),
+                "10.0.0.0/8".to_string(),
+            ]
+        );
+        assert!(eg.deny_all_other);
+    }
+
+    #[test]
+    fn egress_is_optional() {
+        let yaml = "image: alpine:latest\nnetwork:\n  subnet: 10.0.0.0/16\n";
+        let config: VmConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.network.as_ref().unwrap().egress.is_none());
+    }
+
+    #[test]
+    fn egress_empty_when_no_allow_no_deny() {
+        let eg = VmEgressConfig::default();
+        assert!(eg.is_empty());
+
+        let eg = VmEgressConfig {
+            allow: vec!["github.com".to_string()],
+            deny_all_other: false,
+        };
+        assert!(!eg.is_empty());
+
+        let eg = VmEgressConfig {
+            allow: vec![],
+            deny_all_other: true,
+        };
+        assert!(!eg.is_empty());
     }
 
     #[test]

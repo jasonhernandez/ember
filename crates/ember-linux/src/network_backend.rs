@@ -72,13 +72,56 @@ impl NetworkBackend for LinuxNetwork {
 
         // Add iptables NAT/forwarding rules tagged with this install's
         // comment so cleanup can scope to *this* installation.
+        //
+        // SEC-263: when the VM has an egress policy with `deny_all_other`,
+        // skip NAT's per-VM blanket `-A FORWARD -i tap -o wan -j ACCEPT`.
+        // That blanket would otherwise sit ahead of the egress DROP in
+        // the FORWARD chain and short-circuit it, making `deny_all_other`
+        // a no-op. The egress allow rules carry approved traffic
+        // instead, and the trailing DROP catches the rest.
+        let policy_enforced = vm
+            .egress
+            .as_ref()
+            .map(|p| p.deny_all_other)
+            .unwrap_or(false);
         let comment = network::nat::comment(ns);
-        if let Err(e) =
-            network::nat::add_rules(&tap_name, &allocation.guest_ip, &wan_iface, &comment)
-        {
+        if let Err(e) = network::nat::add_rules(
+            &tap_name,
+            &allocation.guest_ip,
+            &wan_iface,
+            &comment,
+            policy_enforced,
+        ) {
             let _ = network::tap::delete(&tap_name);
             let _ = network::ip::release(&self.store, &vm.name);
             return Err(e);
+        }
+
+        // SEC-263: apply per-VM egress allow-list rules if the VM has
+        // a policy on its metadata. Generation is pure and unit-tested;
+        // failure here unwinds the NAT rules so we don't leak state.
+        if let Some(ref policy) = vm.egress {
+            if !policy.is_empty() {
+                let resolver = network::egress::SystemResolver;
+                let rules = network::egress::generate_rules(
+                    policy,
+                    &allocation.guest_ip,
+                    &wan_iface,
+                    &comment,
+                    &resolver,
+                );
+                if let Err(e) = network::egress::apply_rules(&rules) {
+                    let _ = network::nat::remove_rules(
+                        &tap_name,
+                        &allocation.guest_ip,
+                        &wan_iface,
+                        &comment,
+                    );
+                    let _ = network::tap::delete(&tap_name);
+                    let _ = network::ip::release(&self.store, &vm.name);
+                    return Err(e);
+                }
+            }
         }
 
         Ok(NetworkInfo {
@@ -96,8 +139,8 @@ impl NetworkBackend for LinuxNetwork {
     /// Best-effort cleanup — continues even if individual steps fail, since
     /// this is called during stop/delete where partial cleanup is acceptable.
     fn teardown(&self, vm: &VmMetadata, config: &GlobalConfig) -> Result<()> {
-        if let Some(ref net_info) = vm.network {
-            network::cleanup(&self.store, config, &vm.name, net_info);
+        if vm.network.is_some() {
+            network::cleanup(&self.store, config, vm);
         }
         Ok(())
     }
