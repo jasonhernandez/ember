@@ -93,7 +93,9 @@ pub fn open(root: &Path) -> Result<Connection> {
 /// shape) and after the documented drain + `rm state.db` + `ember init`.
 fn check_schema_drift(conn: &Connection) -> Result<()> {
     let has_single_address: bool = conn
-        .prepare("SELECT 1 FROM pragma_table_info('network_allocations') WHERE name = 'single_address'")?
+        .prepare(
+            "SELECT 1 FROM pragma_table_info('network_allocations') WHERE name = 'single_address'",
+        )?
         .exists([])?;
     if !has_single_address {
         return Err(crate::error::Error::State(
