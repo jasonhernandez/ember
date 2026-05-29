@@ -19,7 +19,8 @@ use crate::state::store::StateStore;
 
 const KERNEL_TAG: &str = "microvm-kernel-6.1.163-20.299.amzn2023";
 const KERNEL_REPO: &str = "https://github.com/amazonlinux/linux.git";
-const BASE_CONFIG_URL: &str = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/main/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config";
+const BASE_CONFIG_X86_64: &str = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/main/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config";
+const BASE_CONFIG_AARCH64: &str = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/main/resources/guest_configs/microvm-kernel-ci-aarch64-6.1.config";
 const BUILDER_IMAGE: &str = "ember-kernel-builder";
 
 const DOCKERFILE: &str = include_str!("../../../../kernel/Dockerfile");
@@ -61,7 +62,19 @@ pub fn detect_container_tool() -> anyhow::Result<String> {
 ///
 /// Returns the path to the installed kernel.
 pub fn build(store: &StateStore, jobs: usize, tool: &str) -> anyhow::Result<PathBuf> {
-    let work_dir = tempfile::tempdir().context("failed to create temp build directory")?;
+    // On macOS, container runtimes (Colima, Docker Desktop) only share $HOME by
+    // default — tempfile's default base (`/var/folders/...`) is outside that
+    // mount, so the `-v` bind would be empty inside the container. Build under
+    // $HOME so the volume mount works without extra Colima mount config (SEC-475 #2).
+    let work_dir = if cfg!(target_os = "macos") {
+        let home = std::env::var("HOME").context("HOME not set")?;
+        tempfile::Builder::new()
+            .prefix(".ember-kernel-build-")
+            .tempdir_in(home)
+            .context("failed to create temp build directory in $HOME")?
+    } else {
+        tempfile::tempdir().context("failed to create temp build directory")?
+    };
     let work = work_dir.path();
 
     println!("Build directory: {}", work.display());
@@ -103,10 +116,23 @@ pub fn build(store: &StateStore, jobs: usize, tool: &str) -> anyhow::Result<Path
         format!("{}:{}", uid, gid)
     };
 
+    // Firecracker ships separate CI base configs per arch; pick the one matching
+    // the build host (and therefore the guest, since AVF/Firecracker run the
+    // guest at host arch). aarch64 hosts must not build with the x86_64 config
+    // (SEC-475 #3).
+    let base_config_url = base_config_url();
+
+    // Build the boot artifact each backend needs:
+    //   - x86_64 (Firecracker): ELF `vmlinux`
+    //   - aarch64 (AVF): the ARM64 boot `Image` (AVF can't boot ELF vmlinux)
+    // `Image` is an arm64-only make target — `make Image` does NOT exist under
+    // arch/x86 and would fail the `set -e` build on x86_64. So gate the make
+    // target by arch, same as the install path (SEC-475 #4).
+    let make_targets = kernel_make_targets();
     let build_script = format!(
         "set -e\n\
          echo '==> Downloading Firecracker CI kernel config...'\n\
-         curl -fSL -o base.config '{BASE_CONFIG_URL}'\n\
+         curl -fSL -o base.config '{base_config_url}'\n\
          echo '==> Cloning kernel source (shallow, tag {KERNEL_TAG})...'\n\
          git clone --depth 1 --branch '{KERNEL_TAG}' '{KERNEL_REPO}' linux\n\
          echo '==> Merging base config + fragments...'\n\
@@ -114,8 +140,8 @@ pub fn build(store: &StateStore, jobs: usize, tool: &str) -> anyhow::Result<Path
          KCONFIG_CONFIG=.config scripts/kconfig/merge_config.sh -m ../base.config ../docker.fragment ../avf.fragment\n\
          sed -i 's/^CONFIG_BUILD_SALT=.*/CONFIG_BUILD_SALT=\"\"/' .config\n\
          make olddefconfig\n\
-         echo '==> Building vmlinux ({jobs} jobs)...'\n\
-         make -j{jobs} vmlinux\n\
+         echo '==> Building kernel ({jobs} jobs)...'\n\
+         make -j{jobs} {make_targets}\n\
          echo '==> Done.'"
     );
 
@@ -138,11 +164,13 @@ pub fn build(store: &StateStore, jobs: usize, tool: &str) -> anyhow::Result<Path
         );
     }
 
-    // Copy the built kernel to the state store.
-    let built = work.join("linux/vmlinux");
+    // Copy the built kernel to the state store. On aarch64 the AVF backend
+    // needs the ARM64 boot Image; on x86_64 Firecracker needs ELF vmlinux
+    // (SEC-475 #4).
+    let built = work.join(built_kernel_subpath());
     if !built.exists() {
         bail!(
-            "build completed but vmlinux not found at {}",
+            "build completed but kernel not found at {}",
             built.display()
         );
     }
@@ -167,6 +195,40 @@ pub fn build(store: &StateStore, jobs: usize, tool: &str) -> anyhow::Result<Path
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/// Firecracker CI base kernel config URL for the build host architecture.
+///
+/// aarch64 hosts (Apple Silicon / ARM servers) need the aarch64 config; every
+/// other arch falls back to x86_64. The kernel runs at host arch under both
+/// Firecracker and AVF, so the build host's arch is the right selector.
+fn base_config_url() -> &'static str {
+    match std::env::consts::ARCH {
+        "aarch64" => BASE_CONFIG_AARCH64,
+        _ => BASE_CONFIG_X86_64,
+    }
+}
+
+/// Path (relative to the build work dir) of the boot artifact to install.
+///
+/// aarch64/AVF boots the ARM64 `Image`; x86_64/Firecracker boots ELF `vmlinux`.
+fn built_kernel_subpath() -> &'static str {
+    match std::env::consts::ARCH {
+        "aarch64" => "linux/arch/arm64/boot/Image",
+        _ => "linux/vmlinux",
+    }
+}
+
+/// `make` target(s) for the boot artifact on the build host arch.
+///
+/// `Image` is an arm64-only target (arch/arm64); x86 has no `Image` rule, only
+/// `vmlinux`/`bzImage`. Building the wrong target fails the `set -e` build, so
+/// each arch builds exactly the artifact [`built_kernel_subpath`] installs.
+fn kernel_make_targets() -> &'static str {
+    match std::env::consts::ARCH {
+        "aarch64" => "Image",
+        _ => "vmlinux",
+    }
+}
 
 /// Build the `docker run` argument list.
 ///
@@ -234,5 +296,53 @@ mod tests {
             !args.contains(&"--user"),
             "--user must NOT be present on macOS"
         );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn base_config_url_is_aarch64_on_arm() {
+        assert!(
+            base_config_url().contains("aarch64"),
+            "aarch64 host must use the aarch64 base config, got: {}",
+            base_config_url()
+        );
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    #[test]
+    fn base_config_url_is_x86_64_off_arm() {
+        assert!(
+            base_config_url().contains("x86_64"),
+            "non-aarch64 host must use the x86_64 base config, got: {}",
+            base_config_url()
+        );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn built_subpath_is_arm64_boot_image_on_arm() {
+        // AVF on aarch64 needs the ARM64 boot Image, not ELF vmlinux.
+        assert_eq!(built_kernel_subpath(), "linux/arch/arm64/boot/Image");
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    #[test]
+    fn built_subpath_is_vmlinux_off_arm() {
+        assert_eq!(built_kernel_subpath(), "linux/vmlinux");
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn make_targets_is_image_on_arm() {
+        // `Image` is the arm64 boot target; building it (not bare `vmlinux`)
+        // is what produces arch/arm64/boot/Image for AVF.
+        assert_eq!(kernel_make_targets(), "Image");
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    #[test]
+    fn make_targets_is_vmlinux_off_arm() {
+        // x86 has no `Image` make target — building it would fail `set -e`.
+        assert_eq!(kernel_make_targets(), "vmlinux");
     }
 }
