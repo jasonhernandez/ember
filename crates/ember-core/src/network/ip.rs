@@ -1042,10 +1042,7 @@ mod tests {
             &no_exclude(),
         )
         .unwrap_err();
-        assert!(
-            err.to_string().contains("strategy mismatch"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("strategy mismatch"), "got: {err}");
     }
 
     // --- Concurrency stress test (SEC-459 regression) ---

@@ -1603,7 +1603,9 @@ fn list(args: &ListArgs, state_dir: &Path) -> anyhow::Result<()> {
                 })
                 .collect();
             print_table(
-                &["NAME", "STATUS", "IMAGE", "IP", "VSOCK", "CPUS", "MEM", "DISK"],
+                &[
+                    "NAME", "STATUS", "IMAGE", "IP", "VSOCK", "CPUS", "MEM", "DISK",
+                ],
                 &[
                     Align::Left,
                     Align::Left,
