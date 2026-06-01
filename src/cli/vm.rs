@@ -1083,6 +1083,30 @@ fn start(args: &StartArgs, state_dir: &Path) -> anyhow::Result<()> {
             Err(e) => {
                 // Non-retriable, or out of attempts: release this slot and bail.
                 let _ = net_backend.teardown(&attempt_meta, &config);
+                // If we got here *because* a transient VZ crash recurred on
+                // every fresh slot (attempt == MAX), it is not per-slot
+                // poisoning — a genuinely poisoned slot would have let one of
+                // the other attempts boot. That signals host-level AVF
+                // capacity exhaustion (SEC-417); surface an actionable
+                // diagnostic instead of the opaque per-attempt error.
+                if e.is_transient_vz_start() {
+                    let running = vm::list(&store)
+                        .map(|vms| {
+                            vms.iter()
+                                .filter(|v| {
+                                    matches!(v.status, VmStatus::Running | VmStatus::Paused)
+                                })
+                                .count()
+                        })
+                        .unwrap_or(0);
+                    return Err(Error::HostVzStartExhausted {
+                        vm_name: metadata.name.clone(),
+                        attempts: attempt,
+                        running,
+                        source: Box::new(e),
+                    }
+                    .into());
+                }
                 return Err(e.into());
             }
         }

@@ -122,6 +122,36 @@ pub enum Error {
         stderr_tail: Vec<String>,
         preserved_log_path: Option<PathBuf>,
     },
+
+    /// A VM-start failed with the same transient VZ crash on *every* network
+    /// slot tried, so it is a host-level Virtualization.framework failure, not
+    /// per-slot poisoning (SEC-417).
+    ///
+    /// The slot-poisoning retry (SEC-419) exists for the case where one vmnet
+    /// slot is poisoned and the next slot boots cleanly. When *all*
+    /// `MAX_VZ_START_ATTEMPTS` fresh slots crash identically, retrying is
+    /// futile: macOS can refuse to start any new VM — regardless of slot or
+    /// guest memory size — after repeated VM create/destroy churn, and that
+    /// capacity only resets on reboot. Surfacing this distinctly turns an
+    /// opaque "ember-vz closed ready-fd" into an actionable diagnostic.
+    #[error(
+        "the macOS hypervisor (Virtualization.framework) refused to start '{vm_name}' \
+         on {attempts} successive network slots — every fresh slot crashed identically \
+         at the hypervisor level, so this is a host-wide failure, not a per-VM one.\n\
+         {running} ember VM(s) are currently running (plus any non-ember VMs such as \
+         Colima/Docker). macOS can stop admitting new VMs after repeated VM \
+         create/destroy churn even when memory is available; the host's VM capacity \
+         only resets on reboot.\n\
+         Fix: stop a running VM with 'ember vm stop <name>' to free capacity, or reboot \
+         the host to clear the leaked hypervisor state."
+    )]
+    HostVzStartExhausted {
+        vm_name: String,
+        attempts: u32,
+        running: usize,
+        #[source]
+        source: Box<Error>,
+    },
 }
 
 /// Render the multi-line diagnostic message for `Error::EmberVzStartFailed`.
@@ -281,6 +311,53 @@ mod tests {
             source: Box::new(Error::Vm("inner".to_string())),
             stderr_tail: vec![],
             preserved_log_path: None,
+        };
+        assert!(err.source().is_some());
+    }
+
+    #[test]
+    fn host_vz_start_exhausted_is_not_treated_as_retriable() {
+        // SEC-417: once we've decided it's host-level exhaustion, it must not
+        // re-enter the slot-poisoning retry path.
+        let err = Error::HostVzStartExhausted {
+            vm_name: "local-dev-4".to_string(),
+            attempts: 3,
+            running: 4,
+            source: Box::new(Error::Vm(
+                "ember-vz closed ready-fd without writing MAC address".to_string(),
+            )),
+        };
+        assert!(!err.is_transient_vz_start());
+    }
+
+    #[test]
+    fn host_vz_start_exhausted_renders_actionable_diagnostic() {
+        let err = Error::HostVzStartExhausted {
+            vm_name: "local-dev-4".to_string(),
+            attempts: 3,
+            running: 4,
+            source: Box::new(Error::Vm("ready-fd crash".to_string())),
+        };
+        let rendered = err.to_string();
+        // Names the VM and the host-wide nature.
+        assert!(rendered.contains("local-dev-4"));
+        assert!(rendered.contains("host-wide failure"));
+        // Reports how many slots were tried and how many VMs are running.
+        assert!(rendered.contains("3 successive network slots"));
+        assert!(rendered.contains("4 ember VM(s)"));
+        // Gives the operator the two concrete remedies.
+        assert!(rendered.contains("ember vm stop"));
+        assert!(rendered.contains("reboot"));
+    }
+
+    #[test]
+    fn host_vz_start_exhausted_source_is_set() {
+        use std::error::Error as StdError;
+        let err = Error::HostVzStartExhausted {
+            vm_name: "x".to_string(),
+            attempts: 3,
+            running: 1,
+            source: Box::new(Error::Vm("inner".to_string())),
         };
         assert!(err.source().is_some());
     }
