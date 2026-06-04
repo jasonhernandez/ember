@@ -176,7 +176,7 @@ impl VmBackend for MacosVm {
         }
 
         // Spawn the helper process.
-        let child = cmd.spawn().map_err(|e| Error::CommandExec {
+        let mut child = cmd.spawn().map_err(|e| Error::CommandExec {
             command: EMBER_VZ_BIN.to_string(),
             source: e,
         })?;
@@ -217,11 +217,34 @@ impl VmBackend for MacosVm {
         let mac = match read_mac_from_ready_fd(read_file, READY_TIMEOUT) {
             Ok(mac) => mac,
             Err(e) => {
-                // Boot failed or timed out — kill the orphaned helper.
-                let _ = nix::sys::signal::kill(
-                    nix::unistd::Pid::from_raw(pid as i32),
-                    nix::sys::signal::Signal::SIGKILL,
-                );
+                // Boot failed, timed out, or helper closed the pipe without
+                // writing.  Capture the helper's exit status BEFORE killing it,
+                // so the operator's error message can distinguish:
+                //   - helper still running (we're about to SIGKILL it)
+                //   - helper exited cleanly (e.g. Darwin.exit(1) on AVF failure)
+                //   - helper crashed via signal (e.g. SIGSEGV from a corrupted
+                //     vmnet handle — the SEC-445 wedge fingerprint)
+                //
+                // The wedge symptom is "exited very fast on its own with code 1
+                // and an empty stderr log" — see SEC-445 root-cause notes.
+                let exit_status = match child.try_wait() {
+                    Ok(Some(status)) => Some(status),
+                    Ok(None) => {
+                        // Still running — kill the orphan, then reap.
+                        let _ = nix::sys::signal::kill(
+                            nix::unistd::Pid::from_raw(pid as i32),
+                            nix::sys::signal::Signal::SIGKILL,
+                        );
+                        // Best-effort wait so we don't leave a zombie.
+                        child.wait().ok()
+                    }
+                    Err(_) => None,
+                };
+
+                // Give the helper's stderr a brief moment to flush before we
+                // read the log.  Even though setbuf(stderr, nil) was added in
+                // ember-vz, OS-level pipe buffering can still hold a few bytes.
+                std::thread::sleep(std::time::Duration::from_millis(50));
 
                 // Surface the ember-vz log before the caller rolls back vm_dir.
                 // Wrap the original error in EmberVzStartFailed so callers can
@@ -229,7 +252,22 @@ impl VmBackend for MacosVm {
                 // but not on CommandExec). Display renders the same multi-line
                 // diagnostic the SEC-466 path produced. SEC-469.
                 let preserved = preserve_ember_vz_log(&config.state_dir, &vm.name, &ember_vz_log);
-                let stderr_tail = read_last_lines(&ember_vz_log, 10);
+                let mut stderr_tail = read_last_lines(&ember_vz_log, 10);
+
+                // SEC-445: when the helper exited fast with no stderr output,
+                // surface the exit signature so operators can recognise the
+                // wedge fingerprint without grepping ps / Activity Monitor.
+                if let Some(status) = exit_status {
+                    stderr_tail.push(format!("(ember-vz process: {})", format_exit(status)));
+                    if stderr_tail.len() == 1 {
+                        stderr_tail.insert(
+                            0,
+                            "(no diagnostic output — see SEC-445 wedge notes if this \
+                             repeats; restarting ember/host typically recovers)"
+                                .to_string(),
+                        );
+                    }
+                }
 
                 return Err(Error::EmberVzStartFailed {
                     source: Box::new(e),
@@ -545,6 +583,25 @@ fn read_last_lines(path: &std::path::Path, n: usize) -> Vec<String> {
     lines[start..].iter().map(|s| s.to_string()).collect()
 }
 
+/// Format a child process `ExitStatus` for operator-facing diagnostics.
+///
+/// Output examples:
+///   - `exit code 1`           (clean exit with code 1)
+///   - `exit code 0`           (clean exit; unusual on the failure path)
+///   - `killed by signal 11`   (SIGSEGV — the SEC-445 wedge fingerprint)
+///   - `killed by signal 9`    (SIGKILL — usually our own kill, not interesting)
+///   - `unknown exit`          (no signal/code information)
+fn format_exit(status: std::process::ExitStatus) -> String {
+    use std::os::unix::process::ExitStatusExt;
+    if let Some(code) = status.code() {
+        format!("exit code {code}")
+    } else if let Some(sig) = status.signal() {
+        format!("killed by signal {sig}")
+    } else {
+        "unknown exit".to_string()
+    }
+}
+
 /// Copy `log_path` to `<state_dir>/failed-starts/<vm_name>-<secs>-<nanos>.log`.
 ///
 /// Creates the `failed-starts` directory if it does not exist.  Returns the
@@ -614,6 +671,29 @@ mod tests {
         let path = dir.path().join("empty.log");
         std::fs::File::create(&path).unwrap();
         assert_eq!(read_last_lines(&path, 10), Vec::<String>::new());
+    }
+
+    // --- format_exit ---
+
+    #[test]
+    fn format_exit_renders_clean_exit_code() {
+        // Use a real subprocess to construct an ExitStatus we can pass in,
+        // since std::process::ExitStatus has no public constructor.
+        let status = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 7"])
+            .status()
+            .unwrap();
+        assert_eq!(format_exit(status), "exit code 7");
+    }
+
+    #[test]
+    fn format_exit_renders_signal_kills() {
+        // SIGTERM (15) is portable across Linux/macOS and standard for exit-via-signal.
+        let status = std::process::Command::new("/bin/sh")
+            .args(["-c", "kill -TERM $$"])
+            .status()
+            .unwrap();
+        assert_eq!(format_exit(status), "killed by signal 15");
     }
 
     // --- preserve_ember_vz_log ---

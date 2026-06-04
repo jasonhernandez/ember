@@ -47,6 +47,20 @@ struct Start: ParsableCommand {
     var vsockPath: String? = nil
 
     func run() throws {
+        // Make stderr unbuffered so any diagnostic line ember-vz writes is
+        // visible in the per-VM log even if the process crashes hard
+        // (SIGKILL, dyld error, etc.) before a normal flush.  Without this,
+        // all the failed-starts/*.log files were 0 bytes after a wedge —
+        // operator had no signal beyond the cryptic "closed ready-fd"
+        // message from the parent.  See SEC-445 root-cause investigation.
+        setbuf(stderr, nil)
+
+        // Emit a startup heartbeat the parent (or operator reading the log)
+        // can use to confirm ember-vz reached its main entry point.  If the
+        // log is empty after a failure, we know the binary failed to launch
+        // (dyld / entitlement / signing) — distinct from "VM creation failed".
+        fputs("ember-vz: starting (kernel=\(kernel), cpus=\(cpus), memory=\(memory))\n", stderr)
+
         // Build the VM configuration (does not require main actor).
         // Log validation errors explicitly before ArgumentParser reformats them.
         let vmConfig: VZVirtualMachineConfiguration
