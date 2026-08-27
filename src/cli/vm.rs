@@ -1007,6 +1007,31 @@ fn check_admission(store: &StateStore, vm_name: &str, requested_mib: u32) -> any
 /// 3 covers the observed case (one poisoned slot) with headroom to spare.
 const MAX_VZ_START_ATTEMPTS: u32 = 3;
 
+/// Smallest plausible size for a real kernel image, in bytes (SEC-417).
+///
+/// Built kernels are tens of MiB; anything under 1 MiB is a truncated or empty
+/// file, not a kernel. Checked before the start-retry loop so an unusable
+/// kernel is never misreported as host capacity exhaustion.
+const MIN_KERNEL_BYTES: u64 = 1024 * 1024;
+
+/// Reject a missing or implausibly small kernel image before attempting to boot.
+///
+/// An unusable kernel crashes the hypervisor identically on every network slot,
+/// so without this guard the slot-poisoning retry burns all
+/// `MAX_VZ_START_ATTEMPTS` and then reports `HostVzStartExhausted` — telling the
+/// operator to reboot when the real fix is `ember kernel build`.
+fn check_kernel_usable(vm_name: &str, kernel_path: &Path) -> Result<(), Error> {
+    let size = std::fs::metadata(kernel_path).ok().map(|m| m.len());
+    match size {
+        Some(n) if n >= MIN_KERNEL_BYTES => Ok(()),
+        other => Err(Error::KernelUnusable {
+            vm_name: vm_name.to_string(),
+            kernel_path: kernel_path.to_path_buf(),
+            size: other,
+        }),
+    }
+}
+
 fn start(args: &StartArgs, state_dir: &Path) -> anyhow::Result<()> {
     use ember_core::cleanup::Rollback;
 
@@ -1028,6 +1053,10 @@ fn start(args: &StartArgs, state_dir: &Path) -> anyhow::Result<()> {
     }
 
     check_admission(&store, &metadata.name, metadata.memory_mib)?;
+
+    // A truncated/empty kernel fails identically on every slot below; catch it
+    // here so it is reported as what it is, not as capacity exhaustion (SEC-417).
+    check_kernel_usable(&metadata.name, &metadata.kernel_path)?;
 
     let mut rollback = Rollback::new();
 
@@ -1083,6 +1112,30 @@ fn start(args: &StartArgs, state_dir: &Path) -> anyhow::Result<()> {
             Err(e) => {
                 // Non-retriable, or out of attempts: release this slot and bail.
                 let _ = net_backend.teardown(&attempt_meta, &config);
+                // If we got here *because* a transient VZ crash recurred on
+                // every fresh slot (attempt == MAX), it is not per-slot
+                // poisoning — a genuinely poisoned slot would have let one of
+                // the other attempts boot. That signals host-level AVF
+                // capacity exhaustion (SEC-417); surface an actionable
+                // diagnostic instead of the opaque per-attempt error.
+                if e.is_transient_vz_start() {
+                    let running = vm::list(&store)
+                        .map(|vms| {
+                            vms.iter()
+                                .filter(|v| {
+                                    matches!(v.status, VmStatus::Running | VmStatus::Paused)
+                                })
+                                .count()
+                        })
+                        .unwrap_or(0);
+                    return Err(Error::HostVzStartExhausted {
+                        vm_name: metadata.name.clone(),
+                        attempts: attempt,
+                        running,
+                        source: Box::new(e),
+                    }
+                    .into());
+                }
                 return Err(e.into());
             }
         }
@@ -1839,6 +1892,51 @@ fn stats(args: &StatsArgs, state_dir: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── SEC-417: kernel guard (thermite #341) ─────────────────────────────
+    //
+    // A 0-byte kernel left by an interrupted `ember kernel build` crashed
+    // every start attempt and was reported as host capacity exhaustion, which
+    // sent operators to reboot the host for three months. The guard must fire
+    // before the retry loop so the real cause is named.
+
+    #[test]
+    fn kernel_guard_rejects_missing_kernel() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("vmlinux-nope");
+        let err = check_kernel_usable("local-dev-1", &missing).unwrap_err();
+        match &err {
+            Error::KernelUnusable { vm_name, size, .. } => {
+                assert_eq!(vm_name, "local-dev-1");
+                assert_eq!(*size, None);
+            }
+            other => panic!("expected KernelUnusable, got {other:?}"),
+        }
+        assert!(err.to_string().contains("missing"));
+        assert!(err.to_string().contains("ember kernel build"));
+    }
+
+    #[test]
+    fn kernel_guard_rejects_zero_byte_kernel() {
+        // The exact failure mode observed on 2026-06-01.
+        let dir = tempfile::tempdir().unwrap();
+        let truncated = dir.path().join("vmlinux-docker-6.1.163");
+        std::fs::write(&truncated, b"").unwrap();
+        let err = check_kernel_usable("local-dev-1", &truncated).unwrap_err();
+        assert!(matches!(err, Error::KernelUnusable { size: Some(0), .. }));
+        let rendered = err.to_string();
+        assert!(rendered.contains("only 0 byte(s)"));
+        // Must NOT send the operator to reboot the host.
+        assert!(!rendered.contains("reboot"));
+    }
+
+    #[test]
+    fn kernel_guard_accepts_plausible_kernel() {
+        let dir = tempfile::tempdir().unwrap();
+        let kernel = dir.path().join("vmlinux");
+        std::fs::write(&kernel, vec![0u8; MIN_KERNEL_BYTES as usize]).unwrap();
+        assert!(check_kernel_usable("local-dev-1", &kernel).is_ok());
+    }
 
     #[test]
     fn build_egress_policy_none_when_empty() {
