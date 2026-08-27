@@ -152,6 +152,32 @@ pub enum Error {
         #[source]
         source: Box<Error>,
     },
+
+    /// The VM's kernel image is missing or too small to be a real kernel
+    /// (SEC-417 follow-up, thermite #341).
+    ///
+    /// This is checked *before* the slot-poisoning retry loop, because an
+    /// unusable kernel crashes the hypervisor identically on every slot and
+    /// would otherwise be misreported as `HostVzStartExhausted` — a wrong
+    /// diagnostic that sends the operator to reboot the host instead of
+    /// rebuilding the kernel. An interrupted `ember kernel build` truncates
+    /// the target to 0 bytes and reproduces exactly this.
+    #[error(
+        "cannot start '{vm_name}': its kernel image at {} is {}.\n\
+         A real kernel is several MiB; an interrupted 'ember kernel build' leaves a \
+         truncated or empty file behind, and the hypervisor then refuses the VM in a \
+         way that looks like host capacity exhaustion.\n\
+         Fix: rebuild the kernel with 'ember kernel build -y' (needs Docker/colima \
+         running), or point 'kernel_path' in the ember config at a valid image.",
+        kernel_path.display(),
+        match size { None => "missing".to_string(), Some(n) => format!("only {n} byte(s)") }
+    )]
+    KernelUnusable {
+        vm_name: String,
+        kernel_path: PathBuf,
+        /// `None` when the file does not exist; otherwise its size in bytes.
+        size: Option<u64>,
+    },
 }
 
 /// Render the multi-line diagnostic message for `Error::EmberVzStartFailed`.
