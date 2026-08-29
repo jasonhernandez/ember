@@ -8,6 +8,7 @@ pub mod platform;
 pub mod reconcile;
 pub mod storage;
 pub mod vm;
+pub mod vsock;
 pub mod zfs;
 pub mod zvol;
 
