@@ -162,6 +162,57 @@ fn delete_removes_image() {
     );
 }
 
+/// `ember image delete` succeeds when the backing dataset is already
+/// gone, and still drops the registry entry.
+///
+/// This is the state an `ember init` onto a different pool leaves
+/// behind: `registry.json` describes datasets that no longer exist
+/// under the configured pool. Before the fix, both supported routes out
+/// (`image delete` and `image build --force`) failed on `zfs destroy`
+/// and the entry could only be removed by hand-editing the registry.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore]
+fn delete_tolerates_missing_dataset() {
+    let env = common::TestEnv::with_image("imgdelmissing");
+    let zvol = format!("{}/ember/images/library-alpine-latest", env.pool);
+    common::linux::assert_dataset_exists(&zvol);
+
+    // Destroy the dataset behind ember's back, simulating a registry
+    // that outlived its pool.
+    let destroyed = std::process::Command::new("zfs")
+        .args(["destroy", "-r", &zvol])
+        .output()
+        .expect("failed to run zfs destroy");
+    assert!(
+        destroyed.status.success(),
+        "setup: zfs destroy failed: {}",
+        String::from_utf8_lossy(&destroyed.stderr)
+    );
+    common::linux::assert_dataset_absent(&zvol);
+
+    let del = common::ember(&[
+        "--state-dir",
+        env.state(),
+        "image",
+        "delete",
+        "alpine:latest",
+    ]);
+    let stdout = String::from_utf8_lossy(&del.stdout);
+    let stderr = String::from_utf8_lossy(&del.stderr);
+    assert!(
+        del.status.success(),
+        "delete of an image with a missing dataset should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+
+    let list = common::ember(&["--state-dir", env.state(), "image", "list"]);
+    let list_stdout = String::from_utf8_lossy(&list.stdout);
+    assert!(
+        list_stdout.contains("No images found"),
+        "registry entry should be gone, got: {list_stdout}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // image build --force tests
 // ---------------------------------------------------------------------------

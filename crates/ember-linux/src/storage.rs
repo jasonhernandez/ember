@@ -188,13 +188,30 @@ impl StorageBackend for LinuxStorage {
     ///
     /// With `force: true`, uses `zfs destroy -R` to also destroy any orphaned
     /// dependent clones (VM zvols) that the application layer couldn't clean up.
+    ///
+    /// An already-absent zvol is success. Deleting an image is a
+    /// convergence operation — a missing dataset is the end state the
+    /// caller asked for — and refusing here strands the registry entry,
+    /// which is what makes `ember image delete` unable to clean up after
+    /// an `ember init` onto a different pool. Real failures (busy,
+    /// permission denied, dependent clones without `--force`) still
+    /// abort, so the registry keeps describing storage that is still
+    /// there. See `zfs::tolerate_missing` for how the two are told apart.
+    ///
+    /// The zvol path is derived from the *configured* pool and dataset,
+    /// never from `ImageEntry::disk_path` — see the note on that field
+    /// for why a recorded path must not steer a destroy.
     fn destroy_image_storage(&self, image: &ImageEntry, force: bool) -> Result<()> {
         let zvol = self.image_zvol(&image.local_name);
-        if force {
-            zfs::destroy_with_dependents(&zvol)
+        let outcome = if force {
+            zfs::destroy_with_dependents_if_present(&zvol)?
         } else {
-            zfs::volume::destroy(&zvol, true)
+            zfs::destroy_if_present(&zvol, true)?
+        };
+        if outcome == zfs::DestroyOutcome::AlreadyAbsent {
+            println!("Image zvol '{zvol}' does not exist — nothing to destroy.");
         }
+        Ok(())
     }
 
     /// Device path for a VM's root disk zvol.
