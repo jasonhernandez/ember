@@ -204,6 +204,16 @@ fn configure_and_boot(
 
     // Configure vsock device if enabled.
     if let Some(ref vsock) = vm.vsock {
+        // Firecracker *binds* this path, so a leftover socket file from a
+        // previous boot makes the PUT /vsock call fail with
+        // "Address in use (os error 98)" and the VM never starts.  Force-stop
+        // and crash paths both leave the file behind, so a killed agent VM
+        // could not be restarted and its pool slot was lost.  Unlinking before
+        // bind is the standard UDS idiom and is safe here: we are booting this
+        // VM, so nothing else owns its socket.
+        if vsock.uds_path.exists() {
+            let _ = std::fs::remove_file(&vsock.uds_path);
+        }
         vm_config = vm_config.with_vsock(
             vsock.uds_path.to_string_lossy().to_string(),
             vsock.guest_cid,
