@@ -63,6 +63,19 @@ impl VmBackend for LinuxVm {
             })?;
         }
 
+        // Same for the vsock socket. `stop` leaves it behind (only the
+        // hypervisor knows when the backend is really gone), and
+        // firecracker's `bind(2)` fails with EADDRINUSE on a leftover
+        // path — a vsock-enabled VM would never restart.
+        if let Some(ref vsock_info) = vm.vsock {
+            if vsock_info.uds_path.exists() {
+                std::fs::remove_file(&vsock_info.uds_path).map_err(|e| Error::Io {
+                    path: vsock_info.uds_path.clone(),
+                    source: e,
+                })?;
+            }
+        }
+
         // Spawn Firecracker process.
         let child = firecracker::process::spawn(socket_path, &log_path)
             .map_err(|e| Error::Firecracker(e.to_string()))?;
@@ -75,6 +88,22 @@ impl VmBackend for LinuxVm {
             Err(e) => {
                 let _ = firecracker::process::kill(pid);
                 return Err(e);
+            }
+        }
+
+        // Hand the vsock socket to the invoking user. This *must* come
+        // after the boot above: firecracker only binds the host-side
+        // socket while building the microVM, so there is nothing to
+        // chmod until `InstanceStart` has been issued.
+        //
+        // Non-fatal: the VM is already running and SSH still works, so a
+        // permission failure degrades the vsock fast path rather than
+        // invalidating the boot. It is loud, though — a silently inert
+        // vsock is the bug this exists to prevent.
+        if let Some(ref vsock_info) = vm.vsock {
+            if let Err(e) = crate::vsock::secure_host_socket(&vsock_info.uds_path) {
+                eprintln!("warning: could not secure vsock socket: {e}");
+                eprintln!("  non-root clients will get EACCES on connect and fall back to SSH.");
             }
         }
 
@@ -204,16 +233,6 @@ fn configure_and_boot(
 
     // Configure vsock device if enabled.
     if let Some(ref vsock) = vm.vsock {
-        // Firecracker *binds* this path, so a leftover socket file from a
-        // previous boot makes the PUT /vsock call fail with
-        // "Address in use (os error 98)" and the VM never starts.  Force-stop
-        // and crash paths both leave the file behind, so a killed agent VM
-        // could not be restarted and its pool slot was lost.  Unlinking before
-        // bind is the standard UDS idiom and is safe here: we are booting this
-        // VM, so nothing else owns its socket.
-        if vsock.uds_path.exists() {
-            let _ = std::fs::remove_file(&vsock.uds_path);
-        }
         vm_config = vm_config.with_vsock(
             vsock.uds_path.to_string_lossy().to_string(),
             vsock.guest_cid,
