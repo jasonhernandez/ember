@@ -1184,6 +1184,16 @@ fn stop(args: &StopArgs, state_dir: &Path) -> anyhow::Result<()> {
     let config: GlobalConfig = store.read(&store.config_path())?;
     let _ = net_backend.teardown(&metadata, &config);
 
+    // Remove the vsock socket file.  Firecracker binds this path on boot, so
+    // leaving it behind makes the next `vm start` fail with "Address in use".
+    // The boot path also unlinks defensively (for crash/force-kill cases);
+    // doing it here keeps a cleanly stopped VM's directory tidy.
+    if let Some(ref vsock) = metadata.vsock {
+        if vsock.uds_path.exists() {
+            let _ = std::fs::remove_file(&vsock.uds_path);
+        }
+    }
+
     // Update metadata.
     metadata.status = VmStatus::Stopped;
     metadata.pid = None;
