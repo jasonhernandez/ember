@@ -5,6 +5,7 @@ use clap::Args;
 use crate::backend::{init_storage, CurrentPlatform, InitConfig, Platform};
 use ember_core::config::size::ByteSize;
 use ember_core::config::{derive_instance_id, DmThinMode, GlobalConfig, StorageKind};
+use ember_core::image::registry::ImageRegistry;
 use ember_core::state::store::StateStore;
 
 /// dm-thin pool block size (in 512-byte sectors) used when the user does
@@ -235,8 +236,59 @@ pub fn run(args: &InitArgs, state_dir: &Path) -> anyhow::Result<()> {
     println!("Instance id: {instance_id}");
     println!("VM IP subnet: {ip_subnet}");
 
+    // The image registry is deliberately *not* reset by init, so a
+    // re-init onto a different pool leaves entries describing datasets
+    // that live in the pool being left behind. Say so — loudly enough
+    // that nobody has to work it out from a later `zfs destroy` error,
+    // but as a warning: init itself succeeded.
+    match ImageRegistry::load(&store) {
+        Ok(registry) => {
+            if let Some(warning) = stale_image_registry_warning(&registry, &config) {
+                eprintln!("\n{warning}");
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "\nWarning: could not read the image registry to check it against pool '{}': {e}",
+                config.pool
+            );
+        }
+    }
+
     println!("\nember initialized successfully.");
     Ok(())
+}
+
+/// Warning text for registry entries whose storage is not where the
+/// just-written config says it should be, or `None` when they all line up.
+///
+/// Reads `ImageEntry::disk_path`, which is display/diagnostic only —
+/// this is a report, never a target for deletion.
+fn stale_image_registry_warning(registry: &ImageRegistry, config: &GlobalConfig) -> Option<String> {
+    let stale = registry.stale_entries(config);
+    if stale.is_empty() {
+        return None;
+    }
+
+    let mut msg = format!(
+        "Warning: {} image(s) in the registry reference storage outside the configured pool '{}':\n",
+        stale.len(),
+        config.pool,
+    );
+    for s in &stale {
+        msg.push_str(&format!(
+            "  {}: registry records '{}', this config uses '{}'\n",
+            s.entry.local_name, s.entry.disk_path, s.expected,
+        ));
+    }
+    msg.push_str(
+        "These entries survived an 'ember init' onto different storage. 'ember image list'\n\
+         still advertises them, but their data is in the pool that was left behind, so\n\
+         'ember vm create' from them will fail. Rebuild or re-pull each image, or drop the\n\
+         stale entry with 'ember image delete <name>' — delete succeeds even when the\n\
+         dataset is already gone.",
+    );
+    Some(msg)
 }
 
 #[cfg(test)]
@@ -259,6 +311,60 @@ mod tests {
             dm_thin_block_size: None,
             dm_thin_mode: None,
         }
+    }
+
+    fn image_entry(local_name: &str, disk_path: &str) -> ember_core::image::registry::ImageEntry {
+        ember_core::image::registry::ImageEntry {
+            reference: format!("local:{local_name}"),
+            local_name: local_name.to_string(),
+            disk_path: disk_path.to_string(),
+            size_mib: 1024,
+            pulled_at: "2026-01-01T00:00:00Z".to_string(),
+            thin_id: None,
+        }
+    }
+
+    /// A registry kept across `ember init --pool ember` while its
+    /// entries still name the old pool gets a warning naming both the
+    /// stale entry and the path the new config implies.
+    #[test]
+    fn init_warns_when_registry_references_foreign_pool() {
+        let mut registry = ImageRegistry::default();
+        registry.add(image_entry(
+            "ubuntu-dev",
+            "manypool/ember/images/ubuntu-dev",
+        ));
+        registry.add(image_entry("debian-dev", "ember/ember/images/debian-dev"));
+
+        let warning =
+            stale_image_registry_warning(&registry, &zfs_config("ember", "ember")).unwrap();
+
+        assert!(warning.starts_with(
+            "Warning: 1 image(s) in the registry reference storage outside the configured pool 'ember':"
+        ));
+        assert!(warning.contains(
+            "  ubuntu-dev: registry records 'manypool/ember/images/ubuntu-dev', \
+             this config uses 'ember/ember/images/ubuntu-dev'"
+        ));
+        // The healthy entry is not named.
+        assert!(!warning.contains("debian-dev"));
+        // And the operator is told how to get out of it.
+        assert!(warning.contains("ember image delete <name>"));
+    }
+
+    #[test]
+    fn init_is_silent_when_registry_matches_pool() {
+        let mut registry = ImageRegistry::default();
+        registry.add(image_entry("ubuntu-dev", "ember/ember/images/ubuntu-dev"));
+        registry.add(image_entry("debian-dev", "ember/ember/images/debian-dev"));
+
+        assert!(stale_image_registry_warning(&registry, &zfs_config("ember", "ember")).is_none());
+    }
+
+    #[test]
+    fn init_is_silent_when_registry_is_empty() {
+        let registry = ImageRegistry::default();
+        assert!(stale_image_registry_warning(&registry, &zfs_config("ember", "ember")).is_none());
     }
 
     #[test]

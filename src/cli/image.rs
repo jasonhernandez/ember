@@ -198,10 +198,11 @@ fn build(args: &BuildArgs, state_dir: &Path) -> anyhow::Result<()> {
             );
         }
 
-        // Delete existing image before rebuilding.
+        // Delete existing image before rebuilding. Same semantics as
+        // `image delete`: a dataset that is already gone does not block
+        // the rebuild, a dataset that refuses to go does.
         println!("Removing existing image '{}'...", local_name);
-        storage.destroy_image_storage(entry, false)?;
-        image::registry::remove_image(&store, &local_name)?;
+        destroy_and_deregister(&store, &storage, entry, false)?;
     }
 
     println!("Building image '{}'...", args.name);
@@ -350,13 +351,35 @@ fn delete(args: &DeleteArgs, state_dir: &Path) -> anyhow::Result<()> {
     // Destroy the image's storage (zvol on Linux, .img file on macOS).
     let config: GlobalConfig = store.read(&store.config_path())?;
     let storage = create_storage(&config);
-    println!("Destroying storage for image '{}'...", local_name);
-    storage.destroy_image_storage(&entry, args.force)?;
-
-    // Remove from registry last, after the storage is gone.
-    image::registry::remove_image(&store, &local_name)?;
+    destroy_and_deregister(&store, &storage, &entry, args.force)?;
 
     println!("Image '{}' deleted.", entry.reference);
+    Ok(())
+}
+
+/// Destroy an image's backing storage, then drop its registry entry.
+///
+/// The order is deliberate and the two halves have different failure
+/// semantics:
+///
+/// * Storage first, registry second. If the destroy fails — the dataset
+///   is busy, or has dependent clones and `--force` was not given — the
+///   entry stays, so `ember image list` keeps describing storage that is
+///   really there and the operator can retry.
+/// * Storage already absent counts as destroyed. Backends treat delete
+///   as convergent (`LinuxStorage::destroy_image_storage`), so an image
+///   whose dataset vanished — after an `ember init` onto a different
+///   pool, say — is still removable through the supported path instead
+///   of requiring a hand-edit of `registry.json`.
+fn destroy_and_deregister(
+    store: &StateStore,
+    storage: &Storage,
+    entry: &ImageEntry,
+    force: bool,
+) -> anyhow::Result<()> {
+    println!("Destroying storage for image '{}'...", entry.local_name);
+    storage.destroy_image_storage(entry, force)?;
+    image::registry::remove_image(store, &entry.local_name)?;
     Ok(())
 }
 
@@ -504,4 +527,180 @@ fn resolve_local_name(registry: &ImageRegistry, name: &str) -> anyhow::Result<St
         name,
         name,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::{InitConfig, StorageBackend};
+    use ember_core::config::size::ByteSize;
+    use ember_core::error::{Error, Result as EmberResult};
+    use std::sync::{Arc, Mutex};
+
+    /// What the fake backend's `destroy_image_storage` should do.
+    enum Destroy {
+        /// Storage is gone (either destroyed now, or it was already
+        /// absent — backends converge on the same answer).
+        Succeeds,
+        /// Storage is still there: busy, permission denied, dependent
+        /// clones without `--force`.
+        Fails(&'static str),
+    }
+
+    struct FakeStorage {
+        destroy: Destroy,
+        destroy_calls: Mutex<Vec<(String, bool)>>,
+    }
+
+    impl FakeStorage {
+        fn new(destroy: Destroy) -> Self {
+            Self {
+                destroy,
+                destroy_calls: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl StorageBackend for FakeStorage {
+        fn init(_config: &InitConfig) -> EmberResult<()> {
+            unimplemented!("not exercised by image delete tests")
+        }
+        fn deinit(&self, _purge: bool) -> EmberResult<()> {
+            unimplemented!("not exercised by image delete tests")
+        }
+        fn grow(&self, _new_size: ByteSize) -> EmberResult<()> {
+            unimplemented!("not exercised by image delete tests")
+        }
+        fn create_image_volume(
+            &self,
+            _name: &str,
+            _image_path: &Path,
+            _size_mib: u64,
+        ) -> EmberResult<VolumeHandle> {
+            unimplemented!("not exercised by image delete tests")
+        }
+        fn clone_for_vm(&self, _image: &ImageEntry, _vm_name: &str) -> EmberResult<VolumeHandle> {
+            unimplemented!("not exercised by image delete tests")
+        }
+        fn resize(&self, _vm: &VmMetadata, _new_size: ByteSize) -> EmberResult<()> {
+            unimplemented!("not exercised by image delete tests")
+        }
+        fn destroy_vm_storage(&self, _vm: &VmMetadata) -> EmberResult<()> {
+            unimplemented!("not exercised by image delete tests")
+        }
+        fn destroy_image_storage(&self, image: &ImageEntry, force: bool) -> EmberResult<()> {
+            self.destroy_calls
+                .lock()
+                .unwrap()
+                .push((image.local_name.clone(), force));
+            match self.destroy {
+                Destroy::Succeeds => Ok(()),
+                Destroy::Fails(msg) => Err(Error::Zfs(msg.to_string())),
+            }
+        }
+        fn disk_device_path(&self, _vm: &VmMetadata) -> EmberResult<PathBuf> {
+            unimplemented!("not exercised by image delete tests")
+        }
+        fn clone_vm_storage(
+            &self,
+            _source: &VmMetadata,
+            _target: &str,
+        ) -> EmberResult<VolumeHandle> {
+            unimplemented!("not exercised by image delete tests")
+        }
+        fn cleanup_fork(&self, _parent: &VmMetadata, _forked: &VmMetadata) -> EmberResult<()> {
+            unimplemented!("not exercised by image delete tests")
+        }
+        fn storage_dependents(&self, _vm: &VmMetadata) -> EmberResult<Vec<String>> {
+            unimplemented!("not exercised by image delete tests")
+        }
+        fn mount(&self, _path: &Path) -> EmberResult<PathBuf> {
+            unimplemented!("not exercised by image delete tests")
+        }
+        fn unmount(&self, _mount_point: &Path) -> EmberResult<()> {
+            unimplemented!("not exercised by image delete tests")
+        }
+    }
+
+    /// A state store holding one registered image, `ubuntu-dev`.
+    fn store_with_image() -> (tempfile::TempDir, StateStore, ImageEntry) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::new(dir.path().to_path_buf());
+        store.init().unwrap();
+
+        let entry = ImageEntry {
+            reference: "local:ubuntu-dev".to_string(),
+            local_name: "ubuntu-dev".to_string(),
+            // Recorded against the pool the operator has since migrated
+            // away from — display-only, and not what gets destroyed.
+            disk_path: "manypool/ember/images/ubuntu-dev".to_string(),
+            size_mib: 25_600,
+            pulled_at: "2026-01-01T00:00:00Z".to_string(),
+            thin_id: None,
+        };
+        let mut registry = ImageRegistry::default();
+        registry.add(entry.clone());
+        registry.save(&store).unwrap();
+
+        (dir, store, entry)
+    }
+
+    /// The bug: the image's dataset is gone (the backend reports storage
+    /// as absent), so the registry entry must go too — otherwise
+    /// `ember image list` keeps advertising an image that is not there
+    /// and the only fix is hand-editing `registry.json`.
+    #[test]
+    fn missing_storage_still_removes_the_registry_entry() {
+        let (_dir, store, entry) = store_with_image();
+        let storage: Storage = Arc::new(FakeStorage::new(Destroy::Succeeds));
+
+        destroy_and_deregister(&store, &storage, &entry, false).unwrap();
+
+        let registry = ImageRegistry::load(&store).unwrap();
+        assert!(
+            !registry.exists("ubuntu-dev"),
+            "registry entry should be gone once storage is absent"
+        );
+    }
+
+    /// A destroy that genuinely failed (busy dataset, permission denied,
+    /// dependent clones without `--force`) must abort *and* leave the
+    /// entry in place: the storage is still there, so the registry must
+    /// keep describing it.
+    #[test]
+    fn real_destroy_failure_aborts_and_keeps_the_entry() {
+        let (_dir, store, entry) = store_with_image();
+        let storage: Storage = Arc::new(FakeStorage::new(Destroy::Fails(
+            "zfs destroy failed (exit code 1): cannot destroy \
+             'ember/ember/images/ubuntu-dev': dataset is busy",
+        )));
+
+        let err = destroy_and_deregister(&store, &storage, &entry, false).unwrap_err();
+        assert!(
+            err.to_string().contains("dataset is busy"),
+            "expected the backend error to surface: {err}"
+        );
+
+        let registry = ImageRegistry::load(&store).unwrap();
+        assert!(
+            registry.exists("ubuntu-dev"),
+            "registry entry must survive a failed destroy"
+        );
+    }
+
+    /// `--force` is passed through to the backend (where it means
+    /// "destroy dependent clones too"), and the image is identified by
+    /// its local name — never by the `disk_path` recorded in the
+    /// registry, which may name a pool ember no longer owns.
+    #[test]
+    fn destroy_is_addressed_by_local_name_and_forwards_force() {
+        let (_dir, store, entry) = store_with_image();
+        let fake = Arc::new(FakeStorage::new(Destroy::Succeeds));
+        let storage: Storage = fake.clone();
+
+        destroy_and_deregister(&store, &storage, &entry, true).unwrap();
+
+        let calls = fake.destroy_calls.lock().unwrap();
+        assert_eq!(calls.as_slice(), [("ubuntu-dev".to_string(), true)]);
+    }
 }

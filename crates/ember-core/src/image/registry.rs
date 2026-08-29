@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::{GlobalConfig, StorageKind};
 use crate::error::{Error, Result};
 use crate::image::pull::ImageReference;
 use crate::state::store::StateStore;
@@ -17,10 +18,35 @@ pub struct ImageEntry {
     pub reference: String,
     /// Filesystem-safe local name (e.g. `library-alpine-latest`).
     pub local_name: String,
-    /// Path to the backing storage for this image.
+    /// Where the backing storage lived **when the image was created**.
     ///
     /// Linux/ZFS: zvol path (e.g. `tank/ember/images/library-alpine-latest`).
     /// macOS/APFS: `.img` file path (e.g. `~/Library/.../images/data/library-alpine-latest.img`).
+    ///
+    /// # Display and diagnostics only — never authoritative
+    ///
+    /// Nothing that creates, opens, or destroys storage may read this
+    /// field. Backends derive paths from the *current* `GlobalConfig`
+    /// (`LinuxStorage::image_zvol`, `DmThinStorage`'s dm names,
+    /// `MacosStorage::image_path`); this string is only rendered by
+    /// `ember image inspect` and compared against the configured
+    /// location by [`ImageRegistry::stale_entries`].
+    ///
+    /// The reason is that the two can disagree, and the recorded value
+    /// is the stale one. `ember init` can be re-run against a different
+    /// pool, dataset, or state directory while `registry.json` is kept;
+    /// every entry then still names the *old* location. A destroy path
+    /// that honoured `disk_path` would reach outside the configured
+    /// pool and wipe datasets the operator may be holding as their only
+    /// rollback — during one such migration, three `ember image delete`
+    /// attempts would have destroyed 25 GB in the pool being kept.
+    /// Deriving from config makes the blast radius of any storage
+    /// operation exactly the pool ember is configured to own.
+    ///
+    /// If you need the real location, ask the backend. If you need to
+    /// know whether an entry is stale, use
+    /// [`ImageRegistry::stale_entries`] — that is a read, and a warning,
+    /// not a target.
     #[serde(alias = "zvol")]
     pub disk_path: String,
     /// Disk size in MiB.
@@ -30,6 +56,19 @@ pub struct ImageEntry {
     /// dm-thin base snapshot id. `None` for other backends.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thin_id: Option<u64>,
+}
+
+/// A registry entry whose recorded storage location disagrees with the
+/// active config, paired with the location the config implies.
+///
+/// Returned by [`ImageRegistry::stale_entries`] so callers can report
+/// both halves of the mismatch.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StaleEntry<'a> {
+    /// The registry entry, with its recorded (old) `disk_path`.
+    pub entry: &'a ImageEntry,
+    /// Where the current config would place this image.
+    pub expected: String,
 }
 
 /// The local image registry: a list of pulled images.
@@ -92,6 +131,43 @@ impl ImageRegistry {
         }
         // Fall back to direct local_name match (for locally built images).
         Ok(self.get(reference))
+    }
+
+    /// Entries whose recorded `disk_path` does not match where `config`
+    /// would put them today.
+    ///
+    /// This is the drift left behind by re-running `ember init` against
+    /// a different pool or dataset while keeping `registry.json`: the
+    /// entries survive, `ember image list` keeps advertising them, but
+    /// their data is in the pool that was left behind. Purely
+    /// diagnostic — callers warn, they do not delete (and in
+    /// particular must not delete *the path named here*; see
+    /// [`ImageEntry::disk_path`]).
+    ///
+    /// Only meaningful for ZFS, where `disk_path` is a dataset name
+    /// derived from pool + dataset and therefore comparable to what
+    /// config yields. dm-thin and macOS encode instance ids and state
+    /// directories into their paths, so a mismatch there is not
+    /// reliably a pool change; those backends return an empty list
+    /// rather than a guess.
+    ///
+    /// Skipped entries: an empty `disk_path` (cleanup stubs), and any
+    /// absolute path. A ZFS dataset name never starts with `/`, while
+    /// macOS `.img` files and dm-thin `/dev/mapper` nodes always do —
+    /// and macOS configs carry the default `StorageKind::Zfs`, so the
+    /// backend field alone would not keep them out.
+    pub fn stale_entries<'a>(&'a self, config: &GlobalConfig) -> Vec<StaleEntry<'a>> {
+        if config.storage_backend != StorageKind::Zfs {
+            return Vec::new();
+        }
+        self.images
+            .iter()
+            .filter(|e| !e.disk_path.is_empty() && !e.disk_path.starts_with('/'))
+            .filter_map(|entry| {
+                let expected = format!("{}/{}", config.images_dataset(), entry.local_name);
+                (entry.disk_path != expected).then_some(StaleEntry { entry, expected })
+            })
+            .collect()
     }
 
     /// Number of tracked images.
@@ -338,6 +414,106 @@ mod tests {
         assert_eq!(json["disk_path"], "tank/ember/images/library-alpine-latest");
         assert_eq!(json["size_mib"], 64);
         assert_eq!(json["pulled_at"], "2026-01-01T00:00:00Z");
+    }
+
+    fn zfs_config(pool: &str, dataset: &str) -> GlobalConfig {
+        GlobalConfig {
+            storage_backend: StorageKind::Zfs,
+            pool: pool.to_string(),
+            dataset: dataset.to_string(),
+            kernel_path: None,
+            wan_iface: None,
+            state_dir: std::path::PathBuf::default(),
+            instance_id: "abcd".to_string(),
+            ip_subnet: "10.100.0.0/16".to_string(),
+            storage_path: None,
+            dm_thin_block_size: None,
+            dm_thin_mode: None,
+        }
+    }
+
+    /// An entry recorded under the pool the operator just migrated away
+    /// from is reported, with the location the new config implies.
+    #[test]
+    fn stale_entries_flags_foreign_pool() {
+        let mut reg = ImageRegistry::default();
+        reg.add(ImageEntry {
+            disk_path: "manypool/ember/images/library-alpine-latest".to_string(),
+            ..sample_entry("alpine")
+        });
+
+        let stale = reg.stale_entries(&zfs_config("ember", "ember"));
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].entry.local_name, "library-alpine-latest");
+        assert_eq!(
+            stale[0].expected,
+            "ember/ember/images/library-alpine-latest"
+        );
+    }
+
+    /// A different *dataset* in the same pool is drift too.
+    #[test]
+    fn stale_entries_flags_foreign_dataset() {
+        let mut reg = ImageRegistry::default();
+        reg.add(ImageEntry {
+            disk_path: "tank/old/images/library-alpine-latest".to_string(),
+            ..sample_entry("alpine")
+        });
+
+        let stale = reg.stale_entries(&zfs_config("tank", "ember"));
+        assert_eq!(stale.len(), 1);
+    }
+
+    #[test]
+    fn stale_entries_silent_when_paths_match() {
+        let mut reg = ImageRegistry::default();
+        // sample_entry records tank/ember/images/<local_name>.
+        reg.add(sample_entry("alpine"));
+        reg.add(sample_entry("ubuntu"));
+
+        assert!(reg.stale_entries(&zfs_config("tank", "ember")).is_empty());
+    }
+
+    #[test]
+    fn stale_entries_skips_empty_disk_path() {
+        let mut reg = ImageRegistry::default();
+        reg.add(ImageEntry {
+            disk_path: String::new(),
+            ..sample_entry("alpine")
+        });
+
+        assert!(reg.stale_entries(&zfs_config("ember", "ember")).is_empty());
+    }
+
+    /// macOS records an absolute `.img` path while its config still
+    /// carries the default `StorageKind::Zfs` — that must not read as
+    /// a pool mismatch.
+    #[test]
+    fn stale_entries_skips_absolute_paths() {
+        let mut reg = ImageRegistry::default();
+        reg.add(ImageEntry {
+            disk_path: "/Users/me/Library/ember/images/data/library-alpine-latest.img".to_string(),
+            ..sample_entry("alpine")
+        });
+
+        assert!(reg.stale_entries(&zfs_config("ember", "ember")).is_empty());
+    }
+
+    /// dm-thin paths encode instance ids, not pool names — a mismatch
+    /// there is not evidence of a pool change, so we stay quiet.
+    #[test]
+    fn stale_entries_empty_for_non_zfs_backends() {
+        let mut reg = ImageRegistry::default();
+        reg.add(ImageEntry {
+            disk_path: "/dev/mapper/ember-abcd-image-library-alpine-latest".to_string(),
+            ..sample_entry("alpine")
+        });
+
+        let config = GlobalConfig {
+            storage_backend: StorageKind::DmThin,
+            ..zfs_config("ember", "ember")
+        };
+        assert!(reg.stale_entries(&config).is_empty());
     }
 
     #[test]
