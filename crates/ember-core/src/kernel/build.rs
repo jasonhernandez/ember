@@ -188,6 +188,10 @@ pub fn build(store: &StateStore, jobs: usize, tool: &str) -> anyhow::Result<Path
         )
     })?;
 
+    // Same rule as KernelSpec::resolve — never hand back a path that a later
+    // `pool start` will reject with an opaque firecracker error.
+    super::validate_kernel_image(&dest)?;
+
     println!("Kernel installed to {}", dest.display());
     Ok(dest)
 }
